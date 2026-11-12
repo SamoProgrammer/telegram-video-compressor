@@ -1425,7 +1425,14 @@ def handle(message: dict, deadline: float | None = None) -> None:
 
 def main() -> None:
     if not TOKEN:
-        sys.exit("BOT_TOKEN is not set")
+        # A missing token must not fail the scheduled shift; GitHub emails on
+        # every failed run and cron keeps retrying every 5 hours.
+        print(
+            "BOT_TOKEN is not set; shift skipped. "
+            "Add the BOT_TOKEN secret and run the workflow again.",
+            flush=True,
+        )
+        return
     if not ALLOWED and not ALLOWED_USERNAMES:
         print(
             "WARNING: ALLOWED_USER_IDS and ALLOWED_USERNAMES are empty; "
