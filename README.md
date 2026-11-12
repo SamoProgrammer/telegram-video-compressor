@@ -110,14 +110,44 @@ If a single video arrives too close to the end of a shift, the bot replies "Not 
 
 | Limit | Value | Why |
 |---|---|---|
-| Input size | 20 MB | Cloud Bot API `getFile` cap |
-| Output size | 50 MB (`MAX_OUTPUT_MB`) | Cloud Bot API upload cap |
+| Input size | 20 MB / ~2 GB¹ | ¹ with `TELEGRAM_API_ID`/`API_HASH` (MTProto) |
+| Output size | 50 MB / ~2 GB¹ | ¹ with `TELEGRAM_API_ID`/`API_HASH` (MTProto) |
 | Duration | 1 hour | Keeps a shift from overrunning |
 | Batch cache | 2 GB (`DISK_BUDGET_MB`) | Oldest cached file is evicted first |
 | Work shift | 5 h 20 min | GitHub Actions 6-hour job cap |
 | Update retention | 24 hours | Telegram retention |
 
 Round video messages ("video messages") are short and usually well under 20 MB, so they work. A 4K 10-minute video will not.
+
+## Big files (20 MB+): the MTProto bypass
+
+The 20 MB download / 50 MB upload caps belong to Telegram's **cloud HTTP Bot API server**, not to Telegram itself. An MTProto client signed in with the **same bot token** (`api_id`/`api_hash` from [my.telegram.org](https://my.telegram.org), free) talks to the Telegram backend directly and can download and upload up to ~2000 MB — this is exactly how Telethon officially supports it (`resolve_bot_file_id` → `download_file`, no user account involved, nothing to log out of).
+
+Set two repository secrets and every big video just works, still 100% on GitHub Actions:
+
+- `TELEGRAM_API_ID`
+- `TELEGRAM_API_HASH`
+
+With those set, the bot:
+
+1. Downloads `>20 MB` inputs via MTProto (Bot API `getFile` for everything under the cap).
+2. Uploads results `>50 MB` via MTProto as the bot itself, with the same inline keyboard.
+3. Still fails politely above ~2 GB (Telegram's hard MTProto bot cap): split such sources first.
+
+Files sent to the bot remain private chat media — the MTProto session is your bot's own login, stored only in the runner's temp directory and wiped at shift end. `cryptg` is installed to make the AES decryption fast.
+
+**Trade-off:** `api_id`/`api_hash` are tied to your Telegram account; using them for your own bot's transfers is the normal, documented use. abuse of MTProto bandwidth can flag the api key — this is a hobby-scale bot, keep volumes sane.
+
+### Other big-file routes considered
+
+| Route | Free? | Verdict |
+|---|---|---|
+| MTProto with bot token (above) | Yes | **Chosen.** No extra server, caps → ~2 GB both ways. |
+| Local Bot API server **on the Actions runner** (`aiogram/telegram-bot-api` docker, `--local`) | Yes | Works, official server. Cost: must `logOut` from cloud API, so 24 h update retention is lost during shift gaps — riskier than MTProto fallback. |
+| User sends a URL (bashupload/gofile/catbox), bot downloads via HTTP | Yes | Zero infra, no input cap at all; the video leaves Telegram and results `>50 MB` need re-hosting. Not implemented. |
+| Split the source into keyframe parts, bot concatenates, compresses, re-splits | Yes | Fully private, but you do a splitting step. Can be added as a "join parts" batch mode. |
+| MTProto with a **user account** (userbot) | Yes | ToS gray zone, account-ban risk, session secret on the runner = account compromise. Not worth it for a bot. |
+| Colab / Kaggle always-on | Yes | Against ToS, sessions die, not a deployment. |
 
 ## Large files: local Bot API mode
 

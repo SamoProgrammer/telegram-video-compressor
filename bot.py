@@ -7,6 +7,7 @@ ffmpeg, and sends them back. See README.md for setup.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -27,6 +28,12 @@ MAX_INPUT_MB = int(os.environ.get("MAX_INPUT_MB", "20"))
 MAX_OUTPUT_MB = int(os.environ.get("MAX_OUTPUT_MB", "50"))
 MAX_DURATION = int(os.environ.get("MAX_DURATION", "3600"))
 DISK_BUDGET_MB = int(os.environ.get("DISK_BUDGET_MB", "2048"))
+# api_id/api_hash (free at my.telegram.org) unlock MTProto transfers: the
+# cloud HTTP Bot API caps downloads at 20 MB and uploads at 50 MB, but the
+# MTProto backend with the same BOT_TOKEN allows ~2 GB both ways.
+TELEGRAM_API_ID = int(os.environ.get("TELEGRAM_API_ID", "0") or 0)
+TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", "").strip()
+MT_UPLOAD_LIMIT = 1900 * 1024 * 1024
 ALLOWED = {
     int(x)
     for x in os.environ.get("ALLOWED_USER_IDS", "").replace(" ", "").split(",")
@@ -118,6 +125,14 @@ def whoami(user_id: int | None, username: str | None) -> str:
     return f"{user_id}" + (f" (@{username})" if username else "")
 
 
+def mt_ready() -> bool:
+    return bool(TELEGRAM_API_ID and TELEGRAM_API_HASH)
+
+
+def mt_upload_limit_bytes() -> int:
+    return MT_UPLOAD_LIMIT if mt_ready() else MAX_OUTPUT_MB * 1024 * 1024
+
+
 def api(method: str, files: dict | None = None, **params):
     url = f"{API_BASE}/bot{TOKEN}/{method}"
     clean = {
@@ -166,14 +181,21 @@ def get_updates(offset: int | None):
 
 
 def download(file_id: str, progress: "ProgressReporter | None" = None) -> Path:
-    info = api("getFile", file_id=file_id)
+    dest = TMP / f"in-{time.time_ns()}.bin"
+    try:
+        info = api("getFile", file_id=file_id)
+    except BotError as exc:
+        # The cloud HTTP Bot API caps getFile at 20 MB; MTProto with the same
+        # bot token does not (official Telethon behavior, no user account).
+        if "too big" not in redact(exc).lower() or not mt_ready():
+            raise
+        return mtproto_download(file_id, dest, progress)
     file_path = info.get("file_path", "")
     # A local Bot API server returns an absolute path and no 20 MB download cap.
     if file_path and os.path.isabs(file_path) and os.path.exists(file_path):
         return Path(file_path)
     if not file_path:
         raise BotError("Telegram returned no file path")
-    dest = TMP / f"in-{time.time_ns()}.bin"
     total = int(info.get("file_size") or 0)
     received = 0
     first = True
@@ -583,6 +605,116 @@ class UploadMeter:
         return self.total
 
 
+def mtproto_download(file_id: str, dest: Path, progress=None) -> Path:
+    """Download via MTProto with the bot's own token; no 20 MB cap."""
+    from telethon import TelegramClient, utils
+
+    async def run() -> Path:
+        client = TelegramClient(
+            str(TMP / "bot.session"), TELEGRAM_API_ID, TELEGRAM_API_HASH
+        )
+        await client.start(bot_token=TOKEN)
+        try:
+            document = utils.resolve_bot_file_id(file_id)
+
+            def callback(current: int, total: int) -> None:
+                if progress and total:
+                    percent = min(100, int(current * 100 / total))
+                    progress.show(f"⏳ Downloading… {percent}%")
+
+            await client.download_file(
+                utils.get_input_document(document),
+                file=str(dest),
+                file_size=document.size,
+                dc_id=document.dc_id,
+                progress_callback=callback,
+            )
+            return dest
+        finally:
+            await client.disconnect()
+
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(run())
+    finally:
+        loop.close()
+
+
+def mtproto_upload(
+    chat_id: int,
+    reply_to: int,
+    path: Path,
+    kind: str,
+    caption: str,
+    filename: str,
+    keyboard: list | None,
+    info: dict,
+    progress=None,
+) -> None:
+    """Upload via MTProto with the bot's own token; no 50 MB cap."""
+    from telethon import TelegramClient, Button, utils
+    from telethon.tl.types import (
+        DocumentAttributeFilename,
+        DocumentAttributeVideo,
+    )
+
+    async def run() -> None:
+        client = TelegramClient(
+            str(TMP / "bot.session"), TELEGRAM_API_ID, TELEGRAM_API_HASH
+        )
+        await client.start(bot_token=TOKEN)
+        try:
+            duration = max(1, int(info["duration"]))
+            width = int(info["width"])
+            height = int(info["height"])
+            if kind == "video_note":
+                attributes = [
+                    DocumentAttributeVideo(
+                        duration, width, height, round_message=True
+                    ),
+                    DocumentAttributeFilename(filename),
+                ]
+            elif kind == "video":
+                attributes = [
+                    DocumentAttributeVideo(
+                        duration, width, height, supports_streaming=True
+                    ),
+                    DocumentAttributeFilename(filename),
+                ]
+            else:
+                attributes = [DocumentAttributeFilename(filename)]
+
+            def callback(current: int, total: int) -> None:
+                if progress and total:
+                    percent = min(100, int(current * 100 / total))
+                    progress.show(f"📤 Uploading… {percent}%")
+
+            await client.send_file(
+                chat_id,
+                str(path),
+                caption=caption,
+                attributes=attributes,
+                force_document=kind == "document",
+                supports_streaming=kind == "video",
+                reply_to=reply_to,
+                buttons=[
+                    [Button.inline(b["text"], b["callback_data"]) for b in row]
+                    for row in keyboard
+                ]
+                if keyboard
+                else None,
+                progress_callback=callback,
+            )
+        finally:
+            await client.disconnect()
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(run())
+    finally:
+        loop.close()
+
+
 def send_result(
     chat_id: int,
     message_id: int,
@@ -594,6 +726,19 @@ def send_result(
     keyboard: list | None = None,
     progress: "ProgressReporter | None" = None,
 ) -> None:
+    if path.stat().st_size > MAX_OUTPUT_MB * 1024 * 1024:
+        mtproto_upload(
+            chat_id,
+            message_id,
+            path,
+            kind,
+            caption,
+            filename,
+            keyboard,
+            info,
+            progress,
+        )
+        return
     reply = reply_params(message_id)
     reply_markup = markup(keyboard) if keyboard else None
     duration = max(1, int(info["duration"]))
@@ -774,10 +919,11 @@ def compress_one(
                 f"Already efficient ({in_mb:.1f} MB). Sent the original.",
             )
         else:
-            if out.stat().st_size > MAX_OUTPUT_MB * 1024 * 1024:
+            if out.stat().st_size > MAX_OUTPUT_MB * 1024 * 1024 and not mt_ready():
                 raise BotError(
                     f"Compressed file is {out_mb:.1f} MB; the upload limit is "
-                    f"{MAX_OUTPUT_MB} MB. Choose a lower resolution or quality."
+                    f"{MAX_OUTPUT_MB} MB. Choose a lower resolution or quality, "
+                    "or set TELEGRAM_API_ID / TELEGRAM_API_HASH for big uploads."
                 )
             caption = (
                 f"✅ {in_mb:.1f} MB → {out_mb:.1f} MB "

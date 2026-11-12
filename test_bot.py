@@ -396,6 +396,54 @@ class ProgressTest(unittest.TestCase):
         self.assertEqual(reporter.texts[-1], "📤 Uploading… 100%")
 
 
+class MtprotoTest(unittest.TestCase):
+    def setUp(self):
+        self.original = (bot.TELEGRAM_API_ID, bot.TELEGRAM_API_HASH, bot.api, bot.mtproto_download)
+
+    def tearDown(self):
+        bot.TELEGRAM_API_ID, bot.TELEGRAM_API_HASH, bot.api, bot.mtproto_download = self.original
+
+    def set_creds(self, on):
+        bot.TELEGRAM_API_ID = 1 if on else 0
+        bot.TELEGRAM_API_HASH = "hash" if on else ""
+
+    def too_big_api(self):
+        def thrower(method, files=None, **params):
+            raise bot.BotError("getFile: file is too big")
+        bot.api = thrower
+
+    def test_upload_limit_extends_with_mtproto(self):
+        self.set_creds(False)
+        self.assertEqual(
+            bot.mt_upload_limit_bytes(), bot.MAX_OUTPUT_MB * 1024 * 1024
+        )
+        self.set_creds(True)
+        self.assertEqual(bot.mt_upload_limit_bytes(), bot.MT_UPLOAD_LIMIT)
+
+    def test_download_falls_back_to_mtproto_on_too_big(self):
+        self.set_creds(True)
+        self.too_big_api()
+        sentinel = Path("mt-sentinel.bin")
+        bot.mtproto_download = lambda file_id, dest, progress=None: sentinel
+        self.assertIs(bot.download("big"), sentinel)
+
+    def test_download_still_fails_without_mtproto(self):
+        self.set_creds(False)
+        self.too_big_api()
+        with self.assertRaises(bot.BotError):
+            bot.download("big")
+
+    def test_download_reraises_other_errors(self):
+        self.set_creds(True)
+
+        def thrower(method, files=None, **params):
+            raise bot.BotError("getFile: network error")
+
+        bot.api = thrower
+        with self.assertRaises(bot.BotError):
+            bot.download("big")
+
+
 class CallbackTest(unittest.TestCase):
     def setUp(self):
         bot.USERS.clear()
