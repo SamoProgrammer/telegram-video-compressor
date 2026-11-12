@@ -127,7 +127,7 @@ class HandleFlowTest(unittest.TestCase):
                 calls.append((method, files, params, size))
                 return {"message_id": 1}
 
-            def fake_download(file_id, progress=None):
+            def fake_download(file_id, progress=None, **kwargs):
                 return src
 
             bot.api = fake_api
@@ -236,7 +236,7 @@ class QueueTest(unittest.TestCase):
             originals = (bot.TMP, bot.DISK_BUDGET, bot.download, bot.probe)
             bot.TMP = tmp
             bot.DISK_BUDGET = 150
-            bot.download = lambda file_id, progress=None: new
+            bot.download = lambda file_id, progress=None, **kwargs: new
             bot.probe = lambda path: {
                 "width": 640,
                 "height": 360,
@@ -261,7 +261,7 @@ class QueueTest(unittest.TestCase):
             item = {"media": {"file_id": "bad"}, "size": 11, "path": None, "name": "bad"}
             originals = (bot.TMP, bot.download, bot.probe)
             bot.TMP = tmp
-            bot.download = lambda file_id, progress=None: bad
+            bot.download = lambda file_id, progress=None, **kwargs: bad
             bot.probe = lambda path: (_ for _ in ()).throw(
                 bot.BotError("No video stream found")
             )
@@ -294,7 +294,7 @@ class OutputLimitTest(unittest.TestCase):
             bot.api = lambda method, files=None, **params: (
                 calls.append((method, params)) or {"message_id": 1}
             )
-            bot.download = lambda file_id, progress=None: src
+            bot.download = lambda file_id, progress=None, **kwargs: src
             bot.probe = lambda path: {
                 "width": 640,
                 "height": 360,
@@ -429,8 +429,8 @@ class MtprotoTest(unittest.TestCase):
         self.set_creds(True)
         self.too_big_api()
         sentinel = Path("mt-sentinel.bin")
-        bot.mtproto_download = lambda file_id, dest, progress=None: sentinel
-        self.assertIs(bot.download("big"), sentinel)
+        bot.mtproto_download = lambda chat_id, message_id, dest, progress=None: sentinel
+        self.assertIs(bot.download("big", chat_id=2, message_id=3), sentinel)
 
     def test_download_still_fails_without_mtproto(self):
         self.set_creds(False)

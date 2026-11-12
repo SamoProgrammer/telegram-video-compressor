@@ -180,16 +180,26 @@ def get_updates(offset: int | None):
     return payload["result"]
 
 
-def download(file_id: str, progress: "ProgressReporter | None" = None) -> Path:
+def download(
+    file_id: str,
+    progress: "ProgressReporter | None" = None,
+    chat_id: int | None = None,
+    message_id: int | None = None,
+) -> Path:
     dest = TMP / f"in-{time.time_ns()}.bin"
     try:
         info = api("getFile", file_id=file_id)
     except BotError as exc:
         # The cloud HTTP Bot API caps getFile at 20 MB; MTProto with the same
         # bot token does not (official Telethon behavior, no user account).
-        if "too big" not in redact(exc).lower() or not mt_ready():
+        if (
+            "too big" not in redact(exc).lower()
+            or not mt_ready()
+            or not chat_id
+            or not message_id
+        ):
             raise
-        return mtproto_download(file_id, dest, progress)
+        return mtproto_download(chat_id, message_id, dest, progress)
     file_path = info.get("file_path", "")
     # A local Bot API server returns an absolute path and no 20 MB download cap.
     if file_path and os.path.isabs(file_path) and os.path.exists(file_path):
@@ -605,9 +615,17 @@ class UploadMeter:
         return self.total
 
 
-def mtproto_download(file_id: str, dest: Path, progress=None) -> Path:
-    """Download via MTProto with the bot's own token; no 20 MB cap."""
-    from telethon import TelegramClient, utils
+def mtproto_download(
+    chat_id: int, message_id: int, dest: Path, progress=None
+) -> Path:
+    """Download via MTProto with the bot's own token; no 20 MB cap.
+
+    Fetches the original message instead of decoding the Bot API file_id
+    (Telethon's codec does not understand modern file_id layouts) — the
+    message carries a fresh file reference, DC and everything else.
+    """
+    from telethon import TelegramClient
+    from telethon.tl.types import InputPeerUser
 
     async def run() -> Path:
         client = TelegramClient(
@@ -615,20 +633,18 @@ def mtproto_download(file_id: str, dest: Path, progress=None) -> Path:
         )
         await client.start(bot_token=TOKEN)
         try:
-            document = utils.resolve_bot_file_id(file_id)
+            # Bots may address users in their own chats without an access hash.
+            peer = InputPeerUser(user_id=chat_id, access_hash=0)
+            message = await client.get_messages(peer, ids=message_id)
+            if not message or not message.media:
+                raise BotError("Could not fetch the original video from Telegram")
 
             def callback(current: int, total: int) -> None:
                 if progress and total:
                     percent = min(100, int(current * 100 / total))
                     progress.show(f"⏳ Downloading… {percent}%")
 
-            await client.download_file(
-                utils.get_input_document(document),
-                file=str(dest),
-                file_size=document.size,
-                dc_id=document.dc_id,
-                progress_callback=callback,
-            )
+            await client.download_media(message, file=str(dest), progress_callback=callback)
             return dest
         finally:
             await client.disconnect()
@@ -652,7 +668,7 @@ def mtproto_upload(
     progress=None,
 ) -> None:
     """Upload via MTProto with the bot's own token; no 50 MB cap."""
-    from telethon import TelegramClient, Button, utils
+    from telethon import TelegramClient, Button
     from telethon.tl.types import (
         DocumentAttributeFilename,
         DocumentAttributeVideo,
@@ -847,7 +863,12 @@ def cache_item(item: dict, queue: list, progress=None) -> str | None:
         safe_unlink(victim["path"])
         victim["path"] = None
     try:
-        path = download(item["media"]["file_id"], progress)
+        path = download(
+            item["media"]["file_id"],
+            progress,
+            chat_id=item.get("chat_id"),
+            message_id=item.get("message_id"),
+        )
     except BotError as exc:
         return f"Could not download: {redact(exc)}"
     try:
@@ -888,7 +909,7 @@ def compress_one(
     out = None
     try:
         if src is None or not src.exists():
-            src = download(media["file_id"], reporter)
+            src = download(media["file_id"], reporter, chat_id=chat_id, message_id=reply_to)
         actual = probe(src)
         if deadline and time.time() + actual["duration"] + 120 > deadline:
             edit_status(chat_id, status_id, "⏳ Not enough time left in this shift.")
@@ -1523,6 +1544,7 @@ def handle(message: dict, deadline: float | None = None) -> None:
         item = {
             "media": media,
             "kind": kind,
+            "chat_id": chat_id,
             "message_id": message_id,
             "size": size,
             "name": short(name),
