@@ -1488,16 +1488,24 @@ def handle(message: dict, deadline: float | None = None) -> None:
     media, kind = found
     size = int(media.get("file_size") or 0)
     duration = float(media.get("duration") or 0)
-    if size > MAX_INPUT_MB * 1024 * 1024:
+    input_cap = MT_UPLOAD_LIMIT if mt_ready() else MAX_INPUT_MB * 1024 * 1024
+    if size > input_cap:
+        if mt_ready():
+            reason = (
+                f"This video is {size / 1048576:.0f} MB; the MTProto bot cap is "
+                f"~2000 MB. Split it into parts and send them in a batch."
+            )
+        else:
+            reason = (
+                f"This video is {size / 1048576:.1f} MB. Telegram's cloud Bot API "
+                f"only lets bots download files up to {MAX_INPUT_MB} MB. "
+                "Set the TELEGRAM_API_ID and TELEGRAM_API_HASH secrets to "
+                "unlock ~2 GB, or send a shorter clip."
+            )
         api(
             "sendMessage",
             chat_id=chat_id,
-            text=(
-                f"This video is {size / 1048576:.1f} MB. Telegram's cloud Bot API "
-                f"only lets bots download files up to {MAX_INPUT_MB} MB. "
-                "Send a shorter clip or a round video message, or run the bot "
-                "with a local Bot API server."
-            ),
+            text=reason,
             reply_parameters=reply_params(message_id),
         )
         return

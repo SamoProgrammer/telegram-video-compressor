@@ -399,9 +399,14 @@ class ProgressTest(unittest.TestCase):
 class MtprotoTest(unittest.TestCase):
     def setUp(self):
         self.original = (bot.TELEGRAM_API_ID, bot.TELEGRAM_API_HASH, bot.api, bot.mtproto_download)
+        self.calls = []
+        bot.api = lambda method, files=None, **params: (
+            self.calls.append((method, params)) or {"message_id": 1}
+        )
 
     def tearDown(self):
         bot.TELEGRAM_API_ID, bot.TELEGRAM_API_HASH, bot.api, bot.mtproto_download = self.original
+        bot.USERS.clear()
 
     def set_creds(self, on):
         bot.TELEGRAM_API_ID = 1 if on else 0
@@ -432,6 +437,49 @@ class MtprotoTest(unittest.TestCase):
         self.too_big_api()
         with self.assertRaises(bot.BotError):
             bot.download("big")
+
+    def test_handle_accepts_big_video_when_mtproto_ready(self):
+        self.set_creds(True)
+        bot.USERS.clear()
+        original_compress_one = bot.compress_one
+        bot.compress_one = lambda *args, **kwargs: {
+            "in": 1.0,
+            "out": 0.5,
+            "saved": True,
+            "kind": "video",
+            "fallback": False,
+        }
+        try:
+            bot.handle(
+                {
+                    "chat": {"id": 2},
+                    "message_id": 3,
+                    "from": {"id": 9},
+                    "video": {
+                        "file_id": "big",
+                        "file_size": 36 * 1024 * 1024,
+                        "duration": 60,
+                    },
+                }
+            )
+        finally:
+            bot.compress_one = original_compress_one
+        texts = [params.get("text", "") for method, params in self.calls if method == "sendMessage"]
+        self.assertFalse(any("20 MB" in t for t in texts))
+
+    def test_handle_rejects_over_mtproto_cap(self):
+        self.set_creds(True)
+        bot.USERS.clear()
+        bot.handle(
+            {
+                "chat": {"id": 2},
+                "message_id": 3,
+                "from": {"id": 9},
+                "video": {"file_id": "huge", "file_size": 3 * 1024 * 1024 * 1024, "duration": 60},
+            }
+        )
+        texts = [params.get("text", "") for method, params in self.calls if method == "sendMessage"]
+        self.assertTrue(texts and "2000 MB" in texts[0])
 
     def test_download_reraises_other_errors(self):
         self.set_creds(True)
