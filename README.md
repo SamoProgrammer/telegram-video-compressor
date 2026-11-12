@@ -45,7 +45,7 @@ Settings (all available as buttons):
 | Setting | Values |
 |---|---|
 | Resolution | Original, 2160p, 1440p, 1080p, 720p, 480p, 360p, 240p |
-| Quality | High (CRF 22), Balanced (CRF 28), Small (CRF 33) |
+| Quality | High (CRF 22, veryfast), Balanced (CRF 25, superfast), Small (CRF 30, superfast) — superfast ≈ 1.5× faster encodes |
 | Output | Auto (same as input), Video, Document, Round video |
 
 Round video output crops to a square and falls back to a regular video when the clip is longer than 60 seconds. Colored buttons use Bot API `style` (`primary`, `success`, `danger`); older clients simply render them unstyled.
@@ -81,15 +81,20 @@ GitHub's Actions terms restrict use to the production, testing, deployment, or p
 
 ## Using the bot
 
-- **Single video** — send one video and get the compressed result with another-video/settings/menu buttons.
-- **Multiple videos** — send all videos first. Each one is downloaded into the batch. Tap **✅ Done** (or send `done`) to start; the bot processes them one by one and posts a summary with total savings.
-- **Settings** — resolution, quality, and output menus. The current value is marked ✅.
-- **Cancel** — the red cancel button during a batch stops after the current video and keeps the rest in the queue. `Clear` deletes the queue.
-- **Retry** — failed videos stay in the queue; tap **✅ Done** again to retry them.
-- **Disk budget** — `DISK_BUDGET_MB` (default 2048) caps the batch cache. When a new video does not fit, the oldest cached file is deleted and downloaded again when its turn comes.
-- **Stale menus** — old buttons answer with "This menu is outdated" instead of doing the wrong thing.
+The whole UX lives on **one control card**: the bot deletes old helper
+messages and re-edits a single message after every event — navigation,
+batch rows, per-video percent progress (download/compress/upload),
+results summary and errors all appear on it, so the chat stays clean.
+Compressed videos arrive as normal replies to your originals.
 
-Batch queues live in the runner's memory, so finish a batch within one shift. If the shift ends mid-batch, the videos already confirmed to the bot must be sent again after the next shift starts. Single videos that arrive too late are left unconfirmed and Telegram redelivers them next shift.
+- **Single video** — send one video; progress and the result land on the card.
+- **Multiple videos** — set 📚 batch mode via the card, send videos (each becomes a row), then tap **▶️ Start** (or send `done`). Zero-to-100% per-phase progress shows per row.
+- **Settings** — ⚙️ on the card; current values are marked ✅.
+- **Cancel** — ✖️ during a batch stops after the current video; unfinished videos return to the queue and ▶️ Start resumes.
+- **Retry** — ❌ rows stay queued; ▶️ Start retries them.
+- **Disk budget** — `DISK_BUDGET_MB` (default 2048); when a new video doesn't fit, the oldest cached file is evicted and re-downloaded on its turn.
+
+**Persistence** — settings, mode and queued items are saved to `bot-state.json`, carried between shifts through the Actions cache: your configuration and batch survive the 5-hour shift rollover (file_ids live for 24 h; expired items fail per-row and can be resent).
 
 ### Shift schedule
 

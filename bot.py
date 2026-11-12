@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Free Telegram video compressor.
 
-Long-polls Telegram from a GitHub Actions runner, compresses videos with
-ffmpeg, and sends them back. See README.md for setup.
+Long-polls Telegram from a GitHub Actions runner. The whole UX lives on
+one self-updating control card per user: navigation, batch state and
+per-phase percent progress are edited onto a single message, superseded
+cards are deleted, and settings/queues persist to a state file that the
+workflow caches between shifts. Large files travel over MTProto with the
+bot's own token. See README.md.
 """
 
 from __future__ import annotations
@@ -28,12 +32,12 @@ MAX_INPUT_MB = int(os.environ.get("MAX_INPUT_MB", "20"))
 MAX_OUTPUT_MB = int(os.environ.get("MAX_OUTPUT_MB", "50"))
 MAX_DURATION = int(os.environ.get("MAX_DURATION", "3600"))
 DISK_BUDGET_MB = int(os.environ.get("DISK_BUDGET_MB", "2048"))
-# api_id/api_hash (free at my.telegram.org) unlock MTProto transfers: the
-# cloud HTTP Bot API caps downloads at 20 MB and uploads at 50 MB, but the
-# MTProto backend with the same BOT_TOKEN allows ~2 GB both ways.
 TELEGRAM_API_ID = int(os.environ.get("TELEGRAM_API_ID", "0") or 0)
 TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", "").strip()
 MT_UPLOAD_LIMIT = 1900 * 1024 * 1024
+STATE_FILE = Path(
+    os.environ.get("BOT_STATE_FILE", str(Path(tempfile.gettempdir()) / "bot-state.json"))
+)
 ALLOWED = {
     int(x)
     for x in os.environ.get("ALLOWED_USER_IDS", "").replace(" ", "").split(",")
@@ -70,10 +74,11 @@ RESOLUTION_CAPS = {
     "360": 640,
     "240": 426,
 }
+# label, x264 preset, CRF — presets trade a little size for real speed.
 QUALITIES = {
-    "high": ("High", 22),
-    "balanced": ("Balanced", 28),
-    "small": ("Small", 33),
+    "high": ("High", "veryfast", 22),
+    "balanced": ("Balanced", "superfast", 25),
+    "small": ("Small", "superfast", 30),
 }
 OUTPUTS = [
     ("auto", "Auto"),
@@ -88,14 +93,21 @@ DISK_BUDGET = DISK_BUDGET_MB * 1024 * 1024
 
 HELP = f"""🎬 Video compressor
 
-1. Tap Single video or Multiple videos.
-2. Send a video, a round video message, or a video file.
-3. Multiple videos: send them all, then tap ✅ Done.
+Everything happens on one card: this message is updated after every
+event and old bot messages are deleted, so the chat stays clean.
+Settings and batch lists survive shift changes.
 
-⚙️ Settings: resolution, quality, and output type.
+1. Tap 🎬 Single or 📚 Multiple.
+2. Send videos (video, round video message, or video file).
+3. In a batch: keep sending, then tap ▶️ Start (or send `done`).
 
-Limits: {MAX_INPUT_MB} MB input, {MAX_DURATION // 60} min.
-For bigger videos, run the bot with a local Bot API server (see README)."""
+✖️ Cancel stops after the current video — everything unfinished goes
+back to the queue. Failed videos stay queued; tap ▶️ Start to retry.
+⚙️ Settings tune resolution, quality and output type — current values
+are marked ✅ and stick forever.
+
+Limits: {MAX_INPUT_MB} MB input without MTProto credentials (~2000 MB
+with them, then uploads too), {MAX_DURATION // 60} min per video."""
 
 
 class BotError(RuntimeError):
@@ -133,6 +145,10 @@ def mt_upload_limit_bytes() -> int:
     return MT_UPLOAD_LIMIT if mt_ready() else MAX_OUTPUT_MB * 1024 * 1024
 
 
+def mt_input_limit_bytes() -> int:
+    return MT_UPLOAD_LIMIT if mt_ready() else MAX_INPUT_MB * 1024 * 1024
+
+
 def api(method: str, files: dict | None = None, **params):
     url = f"{API_BASE}/bot{TOKEN}/{method}"
     clean = {
@@ -141,9 +157,8 @@ def api(method: str, files: dict | None = None, **params):
         if value is not None
     }
     try:
-        # Per-call connection: upload-percent edits fire from inside the
-        # multipart body reader, so api() must never wait on a lock that the
-        # in-flight upload itself is holding.
+        # Per-call connection: card edits can fire from inside a streaming
+        # upload, so api() must never wait on a lock the upload holds.
         response = requests.post(url, data=clean, files=files, timeout=600)
     except requests.RequestException:
         raise BotError(f"{method}: network error") from None
@@ -180,63 +195,19 @@ def get_updates(offset: int | None):
     return payload["result"]
 
 
-def download(
-    file_id: str,
-    progress: "ProgressReporter | None" = None,
-    chat_id: int | None = None,
-    message_id: int | None = None,
-) -> Path:
-    dest = TMP / f"in-{time.time_ns()}.bin"
-    try:
-        info = api("getFile", file_id=file_id)
-    except BotError as exc:
-        # The cloud HTTP Bot API caps getFile at 20 MB; MTProto with the same
-        # bot token does not (official Telethon behavior, no user account).
-        if (
-            "too big" not in redact(exc).lower()
-            or not mt_ready()
-            or not chat_id
-            or not message_id
-        ):
-            raise
-        return mtproto_download(chat_id, message_id, dest, progress)
-    file_path = info.get("file_path", "")
-    # A local Bot API server returns an absolute path and no 20 MB download cap.
-    if file_path and os.path.isabs(file_path) and os.path.exists(file_path):
-        return Path(file_path)
-    if not file_path:
-        raise BotError("Telegram returned no file path")
-    total = int(info.get("file_size") or 0)
-    received = 0
-    first = True
-    try:
-        with requests.get(
-            f"{API_BASE}/file/bot{TOKEN}/{file_path}", stream=True, timeout=600
-        ) as response:
-            if response.status_code != 200:
-                raise BotError(f"Download failed (HTTP {response.status_code})")
-            with dest.open("wb") as handle:
-                for chunk in response.iter_content(chunk_size=256 * 1024):
-                    if not chunk:
-                        continue
-                    handle.write(chunk)
-                    received += len(chunk)
-                    if progress:
-                        if total:
-                            percent = min(100, received * 100 // total)
-                            progress.show(
-                                f"⏳ Downloading… {percent}%",
-                                force=first or received >= total,
-                            )
-                        else:
-                            progress.show(
-                                f"⏳ Downloading… {received / 1048576:.1f} MB",
-                                force=first,
-                            )
-                        first = False
-    except requests.RequestException:
-        raise BotError("Download failed (network error)") from None
-    return dest
+class Throttle:
+    """Decides whether a percent-heavy stream may repaint the card now."""
+
+    def __init__(self, interval: float = 2.5):
+        self.interval = interval
+        self.stamp = 0.0
+
+    def allow(self, force: bool = False) -> bool:
+        now = time.time()
+        if force or now - self.stamp >= self.interval:
+            self.stamp = now
+            return True
+        return False
 
 
 def probe(path: Path) -> dict:
@@ -281,18 +252,229 @@ def probe(path: Path) -> dict:
     }
 
 
-def resolution_label(value: str) -> str:
-    return "Original" if value == "original" else f"≤{value}p"
+def pick_media(message: dict):
+    if "video_note" in message:
+        return message["video_note"], "video_note"
+    if "video" in message:
+        return message["video"], "video"
+    if "animation" in message:
+        return message["animation"], "video"
+    document = message.get("document")
+    if document:
+        name = (document.get("file_name") or "").lower()
+        mime = (document.get("mime_type") or "").lower()
+        suffixes = {
+            ".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v",
+            ".3gp", ".3g2", ".ts", ".mts", ".m2ts", ".ogv",
+        }
+        if mime.startswith("video/") or Path(name).suffix in suffixes:
+            return document, "document"
+    return None
+
+
+def reply_params(message_id: int) -> str:
+    return json.dumps(
+        {"message_id": message_id, "allow_sending_without_reply": True}
+    )
+
+
+def btn(text: str, data: str, style: str | None = None) -> dict:
+    button = {"text": text, "callback_data": data}
+    if style:
+        button["style"] = style
+    return button
+
+
+def markup(rows: list) -> str:
+    return json.dumps({"inline_keyboard": rows})
+
+
+def short(text: object, limit: int = 28) -> str:
+    value = str(text)
+    return value if len(value) <= limit else value[: limit - 1] + "…"
+
+
+def download(
+    file_id: str,
+    on_percent=None,
+    chat_id: int | None = None,
+    message_id: int | None = None,
+) -> Path:
+    dest = TMP / f"in-{time.time_ns()}.bin"
+    try:
+        info = api("getFile", file_id=file_id)
+    except BotError as exc:
+        # The cloud HTTP Bot API caps getFile at 20 MB; MTProto with the
+        # same bot token does not.
+        if (
+            "too big" not in redact(exc).lower()
+            or not mt_ready()
+            or not chat_id
+            or not message_id
+        ):
+            raise
+        return mtproto_download(chat_id, message_id, dest, on_percent)
+    file_path = info.get("file_path", "")
+    # A local Bot API server returns an absolute path and no cap.
+    if file_path and os.path.isabs(file_path) and os.path.exists(file_path):
+        return Path(file_path)
+    if not file_path:
+        raise BotError("Telegram returned no file path")
+    total = int(info.get("file_size") or 0)
+    received = 0
+    first = True
+    try:
+        with requests.get(
+            f"{API_BASE}/file/bot{TOKEN}/{file_path}", stream=True, timeout=600
+        ) as response:
+            if response.status_code != 200:
+                raise BotError(f"Download failed (HTTP {response.status_code})")
+            with dest.open("wb") as handle:
+                for part in response.iter_content(chunk_size=256 * 1024):
+                    if not part:
+                        continue
+                    handle.write(part)
+                    received += len(part)
+                    if on_percent and total:
+                        on_percent(min(100, received * 100 // total))
+                    elif on_percent:
+                        on_percent(None)
+                        first = False
+    except requests.RequestException:
+        raise BotError("Download failed (network error)") from None
+    return dest
+
+
+def _hhmmss(value: str) -> float:
+    try:
+        hours, minutes, seconds = value.split(":")
+        return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    except ValueError:
+        return 0.0
+
+
+def mt_regions(
+    total: int, branches: int = 6, min_each: int = 8 * 1024 * 1024
+) -> list:
+    """Plan [start, length] regions on 512 KB-aligned offsets."""
+    count = max(1, min(branches, max(1, total // min_each)))
+    size = max(512 * 1024, (total // count) - (total // count) % (512 * 1024))
+    plan = []
+    offset = 0
+    for _ in range(count - 1):
+        plan.append((offset, size))
+        offset += size
+    if offset < total:
+        plan.append((offset, total - offset))
+    return plan
+
+
+def mtproto_download(
+    chat_id: int, message_id: int, dest: Path, on_percent=None
+) -> Path:
+    """Parallel download via MTProto with the bot's own token; no 20 MB cap.
+
+    Fetches the original message (modern Bot API file_ids cannot be decoded
+    by Telethon) and streams multiple connections in parallel — one
+    MTProto connection saturates far below what Telegram allows.
+    """
+    from telethon import TelegramClient
+    from telethon.tl.types import InputPeerUser
+    from telethon import utils as telethon_utils
+
+    chunk = 512 * 1024
+
+    async def start(index: int) -> TelegramClient:
+        client = TelegramClient(
+            str(TMP / f"bot-m{index}.session"), TELEGRAM_API_ID, TELEGRAM_API_HASH
+        )
+        await client.start(bot_token=TOKEN)
+        return client
+
+    async def pump(client, location, dc_id, offset, length, handle, state, total):
+        remaining = length
+        async for piece in client.iter_download(
+            location, dc_id=dc_id, offset=offset, request_size=chunk, file_size=total
+        ):
+            if remaining <= 0:
+                break
+            take = piece[:remaining]
+            handle.write(take)
+            remaining -= len(take)
+            state["done"] += len(take)
+            if on_percent:
+                on_percent(min(100, int(state["done"] * 100 / total)))
+
+    async def run() -> Path:
+        main = await start(0)
+        clients = [main]
+        try:
+            # Bots may address users in their own chats without an access hash.
+            peer = InputPeerUser(user_id=chat_id, access_hash=0)
+            message = await main.get_messages(peer, ids=message_id)
+            if not message or not message.document:
+                raise BotError("Could not fetch the original video from Telegram")
+            document = message.document
+            dc_id, location = telethon_utils.get_input_location(document)
+            total = document.size
+
+            regions = mt_regions(total)
+            state = {"done": 0}
+            if len(regions) == 1:
+                with open(dest, "wb") as handle:
+                    async for piece in main.iter_download(
+                        location, dc_id=dc_id, request_size=chunk, file_size=total
+                    ):
+                        handle.write(piece)
+                        state["done"] += len(piece)
+                        if on_percent:
+                            on_percent(min(100, int(state["done"] * 100 / total)))
+            else:
+                with open(dest, "wb") as handle:
+                    handle.truncate(total)
+                handles = []
+                try:
+                    for index, (offset, length) in enumerate(regions):
+                        client = main if index == 0 else await start(index)
+                        clients.append(client)
+                        handle = open(dest, "r+b")
+                        handle.seek(offset)
+                        handles.append(handle)
+                    await asyncio.gather(
+                        *(
+                            pump(client, location, dc_id, offset, length, handle, state, total)
+                            for (client, (offset, length), handle) in zip(
+                                clients, regions, handles
+                            )
+                        )
+                    )
+                finally:
+                    for handle in handles:
+                        handle.close()
+            if dest.stat().st_size != total:
+                raise BotError("MTProto download came back truncated; try again")
+            return dest
+        finally:
+            for client in clients:
+                await client.disconnect()
+
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(run())
+    finally:
+        loop.close()
 
 
 def settings_line(settings: dict) -> str:
-    resolution = resolution_label(settings.get("resolution", "720"))
-    quality = QUALITIES.get(settings.get("quality", "balanced"), ("Balanced", 28))[0]
+    resolution = (
+        "Original" if settings.get("resolution") == "original" else f"≤{settings.get('resolution', '720')}p"
+    )
+    quality = QUALITIES.get(settings.get("quality", "balanced"), QUALITIES["balanced"])
     output = OUTPUT_LABELS.get(settings.get("output", "auto"), "Auto")
-    return f"{resolution} • {quality} • {output}"
+    return f"{resolution} • {quality[0]} • {output}"
 
 
-def target_kind(kind: str, settings: dict, duration: float) -> tuple[str, bool]:
+def target_kind(kind: str, settings: dict, duration: float) -> tuple:
     output = settings.get("output", "auto")
     if output == "auto":
         out = kind
@@ -326,31 +508,23 @@ def video_filter(kind: str, settings: dict | None = None) -> str:
     )
 
 
-def _hhmmss(value: str) -> float:
-    try:
-        hours, minutes, seconds = value.split(":")
-        return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
-    except ValueError:
-        return 0.0
-
-
 def compress(
     src: Path,
     dst: Path,
     kind: str,
     settings: dict | None = None,
     duration: float = 0.0,
-    progress: "ProgressReporter | None" = None,
+    on_percent=None,
 ) -> dict:
     settings = settings or DEFAULT_SETTINGS
     # shortcut: HDR is flattened to SDR without tonemapping; add zscale if needed.
     info = probe(src)
     if info["duration"] > MAX_DURATION:
         raise BotError(
-            f"Video is {info['duration'] / 60:.0f} min; "
-            f"limit is {MAX_DURATION // 60} min."
+            f"Video is {info['duration'] / 60:.0f} min; limit is {MAX_DURATION // 60} min."
         )
-    crf = QUALITIES.get(settings.get("quality", "balanced"), ("Balanced", 28))[1]
+    quality = QUALITIES.get(settings.get("quality", "balanced"), QUALITIES["balanced"])
+    crf = quality[2]
     if kind == "video_note":
         crf = min(51, crf + 2)
     cmd = [
@@ -373,7 +547,7 @@ def compress(
         "-c:v",
         "libx264",
         "-preset",
-        "veryfast",
+        quality[1],
         "-crf",
         str(crf),
         "-profile:v",
@@ -415,17 +589,13 @@ def compress(
             watchdog = threading.Timer(MAX_DURATION, kill_on_timeout)
             watchdog.start()
             for line in process.stdout:
-                if not progress:
+                if not on_percent or duration <= 0:
                     continue
-                if line.startswith("out_time=") and duration > 0:
+                if line.startswith("out_time="):
                     seconds = _hhmmss(line.split("=", 1)[1].strip())
-                    percent = max(1, min(99, int(seconds * 100 / duration)))
-                    progress.show(
-                        f"⚙️ Compressing… {percent}%",
-                        force=int(seconds) < 2,
-                    )
+                    on_percent(max(1, min(99, int(seconds * 100 / duration))))
                 elif line.startswith("progress=end"):
-                    progress.show("⚙️ Compressing… 100%", force=True)
+                    on_percent(100)
             process.stdout.close()
             try:
                 process.wait(timeout=60)
@@ -436,9 +606,7 @@ def compress(
                 raise BotError("Compression timed out")
             if process.returncode != 0:
                 detail = err_file.read_text(errors="replace").strip().splitlines()
-                raise BotError(
-                    f"ffmpeg failed: {detail[-1] if detail else 'unknown'}"
-                )
+                raise BotError(f"ffmpeg failed: {detail[-1] if detail else 'unknown'}")
     except OSError as exc:
         raise BotError(f"ffmpeg is not installed: {exc}") from None
     finally:
@@ -446,447 +614,6 @@ def compress(
             watchdog.cancel()
         err_file.unlink(missing_ok=True)
     return probe(dst)
-
-
-def pick_media(message: dict):
-    if "video_note" in message:
-        return message["video_note"], "video_note"
-    if "video" in message:
-        return message["video"], "video"
-    if "animation" in message:
-        return message["animation"], "video"
-    document = message.get("document")
-    if document:
-        name = (document.get("file_name") or "").lower()
-        mime = (document.get("mime_type") or "").lower()
-        suffixes = {
-            ".mp4",
-            ".mov",
-            ".mkv",
-            ".webm",
-            ".avi",
-            ".m4v",
-            ".3gp",
-            ".3g2",
-            ".ts",
-            ".mts",
-            ".m2ts",
-            ".ogv",
-        }
-        if mime.startswith("video/") or Path(name).suffix in suffixes:
-            return document, "document"
-    return None
-
-
-def reply_params(message_id: int) -> str:
-    return json.dumps(
-        {"message_id": message_id, "allow_sending_without_reply": True}
-    )
-
-
-def btn(text: str, data: str, style: str | None = None) -> dict:
-    button = {"text": text, "callback_data": data}
-    if style:
-        button["style"] = style
-    return button
-
-
-def markup(rows: list) -> str:
-    return json.dumps({"inline_keyboard": rows})
-
-
-def edit_status(chat_id: int, message_id: int, text: str) -> None:
-    try:
-        api("editMessageText", chat_id=chat_id, message_id=message_id, text=text)
-    except BotError:
-        pass
-
-
-class ProgressReporter:
-    """Edits one status message with per-phase percent, throttled."""
-
-    interval = 2.5
-
-    def __init__(self, chat_id: int, message_id: int):
-        self.chat_id = chat_id
-        self.message_id = message_id
-        self.text = ""
-        self.stamp = 0.0
-
-    def show(self, text: str, force: bool = False) -> None:
-        now = time.time()
-        if text == self.text or (not force and now - self.stamp < self.interval):
-            return
-        self.text, self.stamp = text, now
-        edit_status(self.chat_id, self.message_id, text)
-
-
-def render_text(
-    chat_id: int, message_id: int, text: str, keyboard: list | None = None
-) -> int:
-    """Edit a text menu; if it is a media message, send a new one instead."""
-    reply_markup = markup(keyboard) if keyboard else None
-    try:
-        api(
-            "editMessageText",
-            chat_id=chat_id,
-            message_id=message_id,
-            text=text,
-            reply_markup=reply_markup,
-        )
-        return message_id
-    except BotError as exc:
-        if "not modified" in redact(exc).lower():
-            return message_id
-        result = api(
-            "sendMessage",
-            chat_id=chat_id,
-            text=text,
-            reply_markup=reply_markup,
-        )
-        return result["message_id"]
-
-
-def send_original(
-    chat_id: int,
-    message_id: int,
-    media: dict,
-    kind: str,
-    keyboard: list | None = None,
-) -> None:
-    reply = reply_params(message_id)
-    reply_markup = markup(keyboard) if keyboard else None
-    if kind == "video_note":
-        api(
-            "sendVideoNote",
-            chat_id=chat_id,
-            video_note=media["file_id"],
-            reply_parameters=reply,
-            reply_markup=reply_markup,
-        )
-    elif kind == "document":
-        api(
-            "sendDocument",
-            chat_id=chat_id,
-            document=media["file_id"],
-            reply_parameters=reply,
-            reply_markup=reply_markup,
-        )
-    else:
-        api(
-            "sendVideo",
-            chat_id=chat_id,
-            video=media["file_id"],
-            reply_parameters=reply,
-            reply_markup=reply_markup,
-        )
-
-
-class UploadMeter:
-    """Wraps the upload body so requests reports real sent-byte percent."""
-
-    def __init__(self, handle, total: int, progress: "ProgressReporter | None"):
-        self.handle = handle
-        self.total = total
-        self.progress = progress
-        self.sent = 0
-        self.first = True
-
-    def read(self, size=-1):
-        data = self.handle.read(size)
-        if data:
-            self.sent += len(data)
-            if self.progress and self.total:
-                percent = min(100, self.sent * 100 // self.total)
-                self.progress.show(
-                    f"📤 Uploading… {percent}%",
-                    force=self.first or self.sent >= self.total,
-                )
-                self.first = False
-        return data
-
-    def tell(self):
-        return self.handle.tell()
-
-    def seek(self, *args, **kwargs):
-        return self.handle.seek(*args, **kwargs)
-
-    def __len__(self):
-        return self.total
-
-
-def mt_regions(total: int, branches: int = 6, min_each: int = 32 * 1024 * 1024):
-    """Plan [start, length] regions on 512 KB-aligned offsets."""
-    count = max(1, min(branches, max(1, total // min_each)))
-    size = max(512 * 1024, (total // count) - (total // count) % (512 * 1024))
-    plan = []
-    offset = 0
-    for _ in range(count - 1):
-        plan.append((offset, size))
-        offset += size
-    if offset < total:
-        plan.append((offset, total - offset))
-    return plan
-
-
-def mtproto_download(
-    chat_id: int, message_id: int, dest: Path, progress=None
-) -> Path:
-    """Parallel MTProto download with the bot's own token; no 20 MB cap.
-
-    Fetches the original message (modern Bot API file_ids cannot be decoded
-    by Telethon), then streams several connections/downloads in parallel —
-    a single MTProto connection is slow against Telegram's DCs.
-    """
-    from telethon import TelegramClient
-    from telethon.tl.types import InputPeerUser
-    from telethon import utils as telethon_utils
-
-    chunk = 512 * 1024
-
-    async def start(index: int) -> TelegramClient:
-        client = TelegramClient(
-            str(TMP / f"bot-m{index}.session"), TELEGRAM_API_ID, TELEGRAM_API_HASH
-        )
-        await client.start(bot_token=TOKEN)
-        return client
-
-    async def pump(client, location, dc_id, offset, length, handle, state, total):
-        remaining = length
-        async for piece in client.iter_download(
-            location, dc_id=dc_id, offset=offset, request_size=chunk, file_size=total
-        ):
-            if remaining <= 0:
-                break
-            take = piece[:remaining]
-            handle.write(take)
-            remaining -= len(take)
-            state["done"] += len(take)
-            if progress and total:
-                percent = min(100, int(state["done"] * 100 / total))
-                progress.show(f"⏳ Downloading… {percent}%")
-
-    async def run() -> Path:
-        main = await start(0)
-        clients = [main]
-        try:
-            # Bots may address users in their own chats without an access hash.
-            peer = InputPeerUser(user_id=chat_id, access_hash=0)
-            message = await main.get_messages(peer, ids=message_id)
-            if not message or not message.document:
-                raise BotError("Could not fetch the original video from Telegram")
-            document = message.document
-            dc_id, location = telethon_utils.get_input_location(document)
-            total = document.size
-
-            regions = mt_regions(total)
-            state = {"done": 0}
-            if len(regions) == 1:
-                with open(dest, "wb") as handle:
-                    async for piece in main.iter_download(
-                        location,
-                        dc_id=dc_id,
-                        request_size=chunk,
-                        file_size=total,
-                    ):
-                        handle.write(piece)
-                        state["done"] += len(piece)
-                        if progress and total:
-                            percent = min(100, int(state["done"] * 100 / total))
-                            progress.show(f"⏳ Downloading… {percent}%")
-            else:
-                with open(dest, "wb") as handle:
-                    handle.truncate(total)
-                handles = []
-                for index, (offset, length) in enumerate(regions):
-                    client = main if index == 0 else await start(index)
-                    clients.append(client)
-                    handle = open(dest, "r+b")
-                    handle.seek(offset)
-                    handles.append(handle)
-                try:
-                    await asyncio.gather(
-                        *(
-                            pump(client, location, dc_id, offset, length, handle, state, total)
-                            for (client, (offset, length), handle) in zip(clients, regions, handles)
-                        )
-                    )
-                finally:
-                    for handle in handles:
-                        handle.close()
-            if dest.stat().st_size != total:
-                raise BotError("MTProto download came back truncated; try again")
-            return dest
-        finally:
-            for client in clients:
-                await client.disconnect()
-
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(run())
-    finally:
-        loop.close()
-
-
-def mtproto_upload(
-    chat_id: int,
-    reply_to: int,
-    path: Path,
-    kind: str,
-    caption: str,
-    filename: str,
-    keyboard: list | None,
-    info: dict,
-    progress=None,
-) -> None:
-    """Upload via MTProto with the bot's own token; no 50 MB cap."""
-    from telethon import TelegramClient, Button
-    from telethon.tl.types import (
-        DocumentAttributeFilename,
-        DocumentAttributeVideo,
-    )
-
-    async def run() -> None:
-        client = TelegramClient(
-            str(TMP / "bot.session"), TELEGRAM_API_ID, TELEGRAM_API_HASH
-        )
-        await client.start(bot_token=TOKEN)
-        try:
-            duration = max(1, int(info["duration"]))
-            width = int(info["width"])
-            height = int(info["height"])
-            if kind == "video_note":
-                attributes = [
-                    DocumentAttributeVideo(
-                        duration, width, height, round_message=True
-                    ),
-                    DocumentAttributeFilename(filename),
-                ]
-            elif kind == "video":
-                attributes = [
-                    DocumentAttributeVideo(
-                        duration, width, height, supports_streaming=True
-                    ),
-                    DocumentAttributeFilename(filename),
-                ]
-            else:
-                attributes = [DocumentAttributeFilename(filename)]
-
-            def callback(current: int, total: int) -> None:
-                if progress and total:
-                    percent = min(100, int(current * 100 / total))
-                    progress.show(f"📤 Uploading… {percent}%")
-
-            await client.send_file(
-                chat_id,
-                str(path),
-                caption=caption,
-                attributes=attributes,
-                force_document=kind == "document",
-                supports_streaming=kind == "video",
-                reply_to=reply_to,
-                buttons=[
-                    [Button.inline(b["text"], b["callback_data"]) for b in row]
-                    for row in keyboard
-                ]
-                if keyboard
-                else None,
-                progress_callback=callback,
-            )
-        finally:
-            await client.disconnect()
-
-    loop = asyncio.new_event_loop()
-    try:
-        loop.run_until_complete(run())
-    finally:
-        loop.close()
-
-
-def send_result(
-    chat_id: int,
-    message_id: int,
-    path: Path,
-    kind: str,
-    info: dict,
-    caption: str,
-    filename: str = "compressed.mp4",
-    keyboard: list | None = None,
-    progress: "ProgressReporter | None" = None,
-) -> None:
-    if path.stat().st_size > MAX_OUTPUT_MB * 1024 * 1024:
-        mtproto_upload(
-            chat_id,
-            message_id,
-            path,
-            kind,
-            caption,
-            filename,
-            keyboard,
-            info,
-            progress,
-        )
-        return
-    reply = reply_params(message_id)
-    reply_markup = markup(keyboard) if keyboard else None
-    duration = max(1, int(info["duration"]))
-    with path.open("rb") as handle:
-        body = UploadMeter(handle, path.stat().st_size, progress) if progress else handle
-        if kind == "video_note":
-            api(
-                "sendVideoNote",
-                files={"video_note": (filename, body, "video/mp4")},
-                chat_id=chat_id,
-                duration=duration,
-                length=int(info["width"]),
-                reply_parameters=reply,
-                reply_markup=reply_markup,
-            )
-        elif kind == "document":
-            api(
-                "sendDocument",
-                files={"document": (filename, body, "video/mp4")},
-                chat_id=chat_id,
-                caption=caption,
-                reply_parameters=reply,
-                reply_markup=reply_markup,
-            )
-        else:
-            api(
-                "sendVideo",
-                files={"video": (filename, body, "video/mp4")},
-                chat_id=chat_id,
-                caption=caption,
-                supports_streaming="true",
-                width=int(info["width"]),
-                height=int(info["height"]),
-                duration=duration,
-                reply_parameters=reply,
-                reply_markup=reply_markup,
-            )
-
-
-def get_state(user_id: int, chat_id: int | None = None) -> dict:
-    with STATE_LOCK:
-        state = USERS.get(user_id)
-        if state is None:
-            state = {
-                "mode": "single",
-                "settings": dict(DEFAULT_SETTINGS),
-                "queue": [],
-                "processing": False,
-                "cancel": False,
-                "menu": None,
-            }
-            USERS[user_id] = state
-        if chat_id is not None:
-            state["chat_id"] = chat_id
-        return state
-
-
-def short(text: object, limit: int = 42) -> str:
-    value = str(text)
-    return value if len(value) <= limit else value[: limit - 1] + "…"
 
 
 def media_name(media: dict, kind: str) -> str:
@@ -918,8 +645,8 @@ def queue_used(queue: list) -> int:
     return total
 
 
-def cache_item(item: dict, queue: list, progress=None) -> str | None:
-    """Download a queued video and evict the oldest cached file if needed."""
+def cache_item(item: dict, queue: list, on_percent=None) -> str | None:
+    """Eagerly download a queued video; evict the oldest file if needed."""
     size = item["size"]
     if size > DISK_BUDGET:
         item["path"] = None
@@ -937,7 +664,7 @@ def cache_item(item: dict, queue: list, progress=None) -> str | None:
     try:
         path = download(
             item["media"]["file_id"],
-            progress,
+            on_percent,
             chat_id=item.get("chat_id"),
             message_id=item.get("message_id"),
         )
@@ -957,6 +684,467 @@ def cache_item(item: dict, queue: list, progress=None) -> str | None:
     return None
 
 
+class UploadMeter:
+    """Streams the upload body and reports real sent-byte percent."""
+
+    def __init__(self, handle, total: int, on_percent):
+        self.handle = handle
+        self.total = total
+        self.on_percent = on_percent
+        self.sent = 0
+        self.first = True
+
+    def read(self, size=-1):
+        data = self.handle.read(size)
+        if data and self.total:
+            self.sent += len(data)
+            if self.on_percent:
+                self.on_percent(min(100, self.sent * 100 // self.total))
+        return data
+
+    def tell(self):
+        return self.handle.tell()
+
+    def seek(self, *args, **kwargs):
+        return self.handle.seek(*args, **kwargs)
+
+    def __len__(self):
+        return self.total
+
+
+def send_original(chat_id: int, message_id: int, media: dict, kind: str) -> None:
+    reply = reply_params(message_id)
+    if kind == "video_note":
+        api(
+            "sendVideoNote",
+            chat_id=chat_id,
+            video_note=media["file_id"],
+            reply_parameters=reply,
+        )
+    elif kind == "document":
+        api(
+            "sendDocument",
+            chat_id=chat_id,
+            document=media["file_id"],
+            reply_parameters=reply,
+        )
+    else:
+        api("sendVideo", chat_id=chat_id, video=media["file_id"], reply_parameters=reply)
+
+
+def send_result(
+    chat_id: int,
+    message_id: int,
+    path: Path,
+    kind: str,
+    info: dict,
+    caption: str,
+    filename: str = "compressed.mp4",
+    on_percent=None,
+) -> None:
+    if path.stat().st_size > mt_upload_limit_bytes():
+        mtproto_upload(
+            chat_id, message_id, path, kind, caption, filename, info, on_percent
+        )
+        return
+    reply = reply_params(message_id)
+    duration = max(1, int(info["duration"]))
+    with path.open("rb") as handle:
+        body = UploadMeter(handle, path.stat().st_size, on_percent) if on_percent else handle
+        if kind == "video_note":
+            api(
+                "sendVideoNote",
+                files={"video_note": (filename, body, "video/mp4")},
+                chat_id=chat_id,
+                duration=duration,
+                length=int(info["width"]),
+                reply_parameters=reply,
+            )
+        elif kind == "document":
+            api(
+                "sendDocument",
+                files={"document": (filename, body, "video/mp4")},
+                chat_id=chat_id,
+                caption=caption,
+                reply_parameters=reply,
+            )
+        else:
+            api(
+                "sendVideo",
+                files={"video": (filename, body, "video/mp4")},
+                chat_id=chat_id,
+                caption=caption,
+                supports_streaming="true",
+                width=int(info["width"]),
+                height=int(info["height"]),
+                duration=duration,
+                reply_parameters=reply,
+            )
+
+
+def mtproto_upload(
+    chat_id: int,
+    message_id: int,
+    path: Path,
+    kind: str,
+    caption: str,
+    filename: str,
+    info: dict,
+    on_percent=None,
+) -> None:
+    """Upload via MTProto with the bot's own token; no 50 MB cap."""
+    from telethon import TelegramClient, Button
+    from telethon.tl.types import (
+        DocumentAttributeFilename,
+        DocumentAttributeVideo,
+    )
+
+    async def run() -> None:
+        client = TelegramClient(
+            str(TMP / "bot.session"), TELEGRAM_API_ID, TELEGRAM_API_HASH
+        )
+        await client.start(bot_token=TOKEN)
+        try:
+            duration = max(1, int(info["duration"]))
+            width = int(info["width"])
+            height = int(info["height"])
+            if kind == "video_note":
+                attributes = [
+                    DocumentAttributeVideo(duration, width, height, round_message=True),
+                    DocumentAttributeFilename(filename),
+                ]
+            elif kind == "video":
+                attributes = [
+                    DocumentAttributeVideo(
+                        duration, width, height, supports_streaming=True
+                    ),
+                    DocumentAttributeFilename(filename),
+                ]
+            else:
+                attributes = [DocumentAttributeFilename(filename)]
+
+            def callback(current: int, total: int) -> None:
+                if on_percent and total:
+                    on_percent(min(100, int(current * 100 / total)))
+
+            await client.send_file(
+                chat_id,
+                str(path),
+                caption=caption,
+                attributes=attributes,
+                force_document=kind == "document",
+                supports_streaming=kind == "video",
+                reply_to=message_id,
+                progress_callback=callback,
+            )
+        finally:
+            await client.disconnect()
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(run())
+    finally:
+        loop.close()
+
+
+def default_state(user_id: int, chat_id: int | None) -> dict:
+    return {
+        "user_id": user_id,
+        "chat_id": chat_id,
+        "mode": "single",
+        "view": "main",
+        "settings": dict(DEFAULT_SETTINGS),
+        "queue": [],
+        "working": [],
+        "menu": None,
+        "cards": [],
+        "processing": False,
+        "cancel": False,
+        "summary": "",
+        "note": "",
+    }
+
+
+def get_state(user_id: int, chat_id: int | None = None) -> dict:
+    with STATE_LOCK:
+        state = USERS.get(user_id)
+        if state is None:
+            state = default_state(user_id, chat_id)
+            USERS[user_id] = state
+        if chat_id is not None:
+            state["chat_id"] = chat_id
+        return state
+
+
+def _public_item(item: dict) -> dict:
+    keep = (
+        "media",
+        "kind",
+        "chat_id",
+        "message_id",
+        "size",
+        "name",
+        "filename",
+        "duration",
+    )
+    return {key: item[key] for key in keep if key in item}
+
+
+def save_state() -> None:
+    try:
+        payload = {}
+        for uid, state in USERS.items():
+            payload[str(uid)] = {
+                "user_id": state["user_id"],
+                "chat_id": state.get("chat_id"),
+                "mode": state["mode"],
+                "view": state["view"],
+                "settings": state["settings"],
+                "summary": state.get("summary", ""),
+                "note": state.get("note", ""),
+                "queue": [_public_item(i) for i in state.get("queue", [])],
+            }
+        tmp = STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload))
+        tmp.replace(STATE_FILE)
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def load_state() -> None:
+    try:
+        payload = json.loads(STATE_FILE.read_text())
+    except (OSError, ValueError):
+        return
+    USERS.clear()
+    for uid, data in payload.items():
+        try:
+            user_id = int(data.get("user_id", uid))
+        except (TypeError, ValueError):
+            continue
+        state = default_state(user_id, data.get("chat_id"))
+        if data.get("mode") in ("single", "batch"):
+            state["mode"] = data["mode"]
+        if data.get("view") in ("main", "settings", "res", "quality", "output", "help"):
+            state["view"] = data["view"]
+        for key in ("resolution", "quality", "output"):
+            if key in data.get("settings", {}):
+                state["settings"][key] = data["settings"][key]
+        state["summary"] = data.get("summary", "")
+        state["note"] = data.get("note", "")
+        for item in data.get("queue", []):
+            if item.get("media") and item.get("message_id"):
+                item.setdefault("path", None)
+                item.setdefault("status", "")
+                item["duration"] = float(item.get("duration") or 0)
+                restored = _public_item(item)
+                restored["path"] = None
+                restored["status"] = ""
+                restored["delivered"] = False
+                state["queue"].append(restored)
+        USERS[user_id] = state
+
+
+def settings_block(state: dict) -> str:
+    settings = state["settings"]
+    resolution = (
+        "Original"
+        if settings["resolution"] == "original"
+        else f"≤{settings['resolution']}p"
+    )
+    quality = QUALITIES.get(settings["quality"], QUALITIES["balanced"])
+    output = OUTPUT_LABELS.get(settings["output"], "Auto")
+    return (
+        f"⚙️ Settings\n\nResolution: {resolution} (never upscales)\n"
+        f"Quality: {quality[0]} ({quality[1]}, CRF {quality[2]})\n"
+        f"Output: {output}\n\nValues are marked ✅ and persist between shifts."
+    )
+
+
+def _views_text(state: dict) -> str:
+    view = state["view"]
+    settings = state["settings"]
+    if view == "res":
+        return "📐 Resolution\n\nLong side cap. Original keeps the source size."
+    if view == "quality":
+        return "🎚 Quality — faster preset = faster encodes, bigger file."
+    if view == "output":
+        return "📦 Output\n\nAuto sends the same kind of message you sent."
+    if view == "help":
+        return HELP
+    return settings_block(state)
+
+
+def _rows(items: list) -> list:
+    lines = []
+    for number, item in enumerate(items, 1):
+        size = item.get("size", 0) / 1048576
+        status = item.get("status") or "queued"
+        lines.append(
+            f"{number}. {short(item.get('name', 'video'), 24)} — {size:.1f} MB · {status}"
+        )
+    return lines
+
+
+def card_text(state: dict) -> str:
+    lines = ["🎬 Video Compressor", f"Settings: {settings_line(state['settings'])}"]
+    if state["processing"]:
+        lines.append(
+            "⏳ Working — only one video runs at a time. Tap ✖️ Cancel to stop."
+        )
+    if state["summary"]:
+        lines.append(state["summary"])
+    if state["note"]:
+        lines.append(f"ℹ️ {state['note']}")
+    lines.append("")
+    view = state["view"]
+    if state["processing"]:
+        lines.append("📚 Batch")
+        lines.extend(_rows(state["working"]) or ["starting…"])
+        if state["cancel"]:
+            lines.append("Stopping after the current video…")
+        return "\n".join(lines)
+    if view == "main":
+        if state["mode"] == "batch":
+            if state["queue"]:
+                lines.append("📚 Batch — videos to compress:")
+                lines.extend(_rows(state["queue"]))
+                lines.append("Send more, or tap ▶️ Start.")
+            else:
+                lines.append("📚 Send videos, then tap ▶️ Start (or send `done`).")
+        else:
+            lines.append("Send one video whenever ready — or switch to 📚 batch mode.")
+    else:
+        lines.append(_views_text(state))
+    return "\n".join(lines)
+
+
+def card_kb(state: dict) -> list:
+    if state["processing"]:
+        return [[btn("✖️ Cancel", "multi:cancel", "danger")]]
+    view = state["view"]
+    if view == "res":
+        return choice_rows(
+            RESOLUTIONS, state["settings"]["resolution"], "set:res:"
+        )
+    if view == "quality":
+        options = [
+            (key, f"{value[0]} (CRF {value[2]})") for key, value in QUALITIES.items()
+        ]
+        return choice_rows(options, state["settings"]["quality"], "set:q:")
+    if view == "output":
+        return choice_rows(OUTPUTS, state["settings"]["output"], "set:out:")
+    if view == "help":
+        return [[btn("⬅️ Menu", "menu:main")]]
+    if view == "settings":
+        settings = state["settings"]
+        resolution = (
+            "Original"
+            if settings["resolution"] == "original"
+            else f"{settings['resolution']}p"
+        )
+        quality = QUALITIES.get(settings["quality"], QUALITIES["balanced"])
+        output = OUTPUT_LABELS.get(settings["output"], "Auto")
+        return [
+            [btn(f"📐 Resolution · {resolution}", "setmenu:res", "primary")],
+            [btn(f"🎚 Quality · {quality[0]}", "setmenu:quality", "primary")],
+            [btn(f"📦 Output · {output}", "setmenu:output", "primary")],
+            [btn("⬅️ Menu", "menu:main")],
+        ]
+    rows = [
+        [
+            btn(
+                "🎬 Single" if state["mode"] != "batch" else "🎬 Single",
+                "menu:single",
+                "success" if state["mode"] == "single" else "primary",
+            ),
+            btn(
+                f"📚 Batch ({len(state['queue'])})"
+                if state["queue"]
+                else "📚 Batch",
+                "menu:multi",
+                "success" if state["mode"] == "batch" else "primary",
+            ),
+        ]
+    ]
+    if state["mode"] == "batch" and state["queue"]:
+        rows.append(
+            [
+                btn("▶️ Start", "multi:done", "success"),
+                btn("🗑 Clear", "multi:clear", "danger"),
+            ]
+        )
+    rows.append([btn("⚙️ Settings", "menu:settings"), btn("❓ Help", "menu:help")])
+    return rows
+
+
+def choice_rows(options: list, current: str, prefix: str) -> list:
+    items = [
+        btn(
+            ("✅ " if key == current else "") + label,
+            f"{prefix}{key}",
+            "success" if key == current else None,
+        )
+        for key, label in options
+    ]
+    rows = [items[i : i + 3] for i in range(0, len(items), 3)]
+    rows.append([btn("⬅️ Settings", "menu:settings")])
+    return rows
+
+
+def card_refresh(state: dict, force: bool = True) -> None:
+    """Edit THE card in place; send a fresh one when needed; delete the rest."""
+    chat_id = state.get("chat_id")
+    if not chat_id:
+        return
+    body, keys = card_text(state), card_kb(state)
+    menu = state.get("menu")
+    if menu and menu[0] == chat_id:
+        try:
+            api(
+                "editMessageText",
+                chat_id=chat_id,
+                message_id=menu[1],
+                text=body,
+                reply_markup=markup(keys),
+            )
+        except BotError as exc:
+            if "not modified" not in redact(exc).lower():
+                menu = None  # stale/deleted/failed edit → send a fresh card
+    if not menu or menu[0] != chat_id:
+        sent = api(
+            "sendMessage",
+            chat_id=chat_id,
+            text=body,
+            reply_markup=markup(keys),
+        )
+        state["cards"].append(sent["message_id"])
+        state["menu"] = (chat_id, sent["message_id"])
+    keep_id = state["menu"][1]
+    for old_id in [cid for cid in state["cards"] if cid != keep_id]:
+        try:
+            api("deleteMessage", chat_id=chat_id, message_id=old_id)
+        except BotError:
+            pass
+    state["cards"] = [keep_id]
+    save_state()
+
+
+def make_report(state: dict, item: dict):
+    """report(status, percent) → live row + throttled card repaint."""
+    gate = Throttle()
+
+    def report(status: str, percent: int | None = None):
+        text = status if percent is None else f"{status} {percent}%"
+        if item.get("status") == text:
+            return
+        item["status"] = text
+        if gate.allow(force=percent is None):
+            card_refresh(state, force=False)
+
+    return report
+
+
 def compress_one(
     chat_id: int,
     reply_to: int,
@@ -965,29 +1153,30 @@ def compress_one(
     settings: dict,
     deadline: float | None = None,
     path: Path | None = None,
-    keyboard: list | None = None,
     filename: str = "compressed.mp4",
+    report=None,
 ) -> dict:
-    status = api(
-        "sendMessage",
-        chat_id=chat_id,
-        text="⏳ Downloading…",
-        reply_parameters=reply_params(reply_to),
-    )
-    status_id = status["message_id"]
-    reporter = ProgressReporter(chat_id, status_id)
-    reporter.text = "⏳ Downloading…"
+    def say(phase: str, percent: int | None = None):
+        if report:
+            report(phase, percent)
+
+    say("⏳ downloading")
     src = path
     out = None
     try:
         if src is None or not src.exists():
-            src = download(media["file_id"], reporter, chat_id=chat_id, message_id=reply_to)
+            src = download(
+                media["file_id"],
+                lambda pct: say("⏳ downloading", pct),
+                chat_id=chat_id,
+                message_id=reply_to,
+            )
         actual = probe(src)
         if deadline and time.time() + actual["duration"] + 120 > deadline:
-            edit_status(chat_id, status_id, "⏳ Not enough time left in this shift.")
+            say("⏳ shift too short — retried next shift")
             raise Defer
         out_kind, fallback = target_kind(kind, settings, actual["duration"])
-        reporter.show("⚙️ Compressing…", force=True)
+        say("⚙️ compressing")
         out = TMP / f"out-{time.time_ns()}.mp4"
         info = compress(
             src,
@@ -995,39 +1184,35 @@ def compress_one(
             out_kind,
             settings,
             duration=actual["duration"],
-            progress=reporter,
+            on_percent=lambda pct: say("⚙️ compressing", pct),
         )
         in_mb = src.stat().st_size / 1048576
         out_mb = out.stat().st_size / 1048576
+        if out.stat().st_size > mt_upload_limit_bytes():
+            limit = "~2000 MB" if mt_ready() else f"{MAX_OUTPUT_MB} MB"
+            raise BotError(
+                f"Compressed file is {out_mb:.1f} MB; the upload limit is "
+                f"{limit}. Choose a lower resolution or quality."
+            )
         if out_mb >= in_mb * 0.98:
             try:
-                send_original(chat_id, reply_to, media, out_kind, keyboard)
+                send_original(chat_id, reply_to, media, out_kind)
             except BotError:
                 if out_kind == kind:
                     raise
-                send_original(chat_id, reply_to, media, kind, keyboard)
-            edit_status(
-                chat_id,
-                status_id,
-                f"Already efficient ({in_mb:.1f} MB). Sent the original.",
-            )
+                send_original(chat_id, reply_to, media, kind)
+            say(f"✅ sent original ({in_mb:.1f} MB)")
         else:
-            if out.stat().st_size > MAX_OUTPUT_MB * 1024 * 1024 and not mt_ready():
-                raise BotError(
-                    f"Compressed file is {out_mb:.1f} MB; the upload limit is "
-                    f"{MAX_OUTPUT_MB} MB. Choose a lower resolution or quality, "
-                    "or set TELEGRAM_API_ID / TELEGRAM_API_HASH for big uploads."
-                )
+            saved = 100 * (1 - out_mb / in_mb)
             caption = (
-                f"✅ {in_mb:.1f} MB → {out_mb:.1f} MB "
-                f"({100 * (1 - out_mb / in_mb):.0f}% smaller) • H.264 • "
-                f"{settings_line(settings)}"
+                f"✅ {in_mb:.1f} MB → {out_mb:.1f} MB ({saved:.0f}% smaller) • "
+                f"H.264 • {settings_line(settings)}"
             )
             if fallback:
                 caption += (
                     "\nRound video is limited to 60 s, so this was sent as a video."
                 )
-            reporter.show("📤 Uploading…", force=True)
+            say("📤 uploading")
             send_result(
                 chat_id,
                 reply_to,
@@ -1036,10 +1221,9 @@ def compress_one(
                 info,
                 caption,
                 filename,
-                keyboard,
-                progress=reporter,
+                on_percent=lambda pct: say("📤 uploading", pct),
             )
-            edit_status(chat_id, status_id, caption)
+            say(f"✅ {in_mb:.1f} → {out_mb:.1f} MB ({saved:.0f}%)")
         return {
             "in": in_mb,
             "out": out_mb if out_mb < in_mb * 0.98 else in_mb,
@@ -1050,10 +1234,11 @@ def compress_one(
     except Defer:
         raise
     except BotError as exc:
-        edit_status(chat_id, status_id, f"❌ {redact(exc)[:350]}")
+        say(f"❌ {redact(exc)[:120]}")
         return {"error": redact(exc)}
     except Exception as exc:  # noqa: BLE001 - never kill the shift
-        edit_status(chat_id, status_id, f"❌ Unexpected error: {redact(exc)[:300]}")
+        say(f"❌ unexpected error")
+        print(f"compress_one: {type(exc).__name__}: {redact(exc)}", flush=True)
         return {"error": redact(exc)}
     finally:
         for path in (src, out):
@@ -1061,193 +1246,49 @@ def compress_one(
                 path.unlink(missing_ok=True)
 
 
-def main_text(state: dict) -> str:
-    queued = (
-        f"\n📚 {len(state['queue'])} video(s) queued." if state["queue"] else ""
-    )
-    return (
-        "🎬 Video Compressor\n\n"
-        "Compress videos to H.264 with ffmpeg.\n"
-        f"Settings: {settings_line(state['settings'])}{queued}\n\n"
-        "Choose how to send videos."
-    )
-
-
-def main_kb(state: dict) -> list:
-    label = (
-        f"📚 Multiple videos ({len(state['queue'])})"
-        if state["queue"]
-        else "📚 Multiple videos"
-    )
-    return [
-        [
-            btn("🎬 Single video", "menu:single", "primary"),
-            btn(label, "menu:multi", "primary"),
-        ],
-        [btn("⚙️ Settings", "menu:settings"), btn("❓ Help", "menu:help")],
-    ]
-
-
-def settings_text(state: dict) -> str:
-    settings = state["settings"]
-    resolution = resolution_label(settings["resolution"])
-    quality = QUALITIES.get(settings["quality"], ("Balanced", 28))
-    output = OUTPUT_LABELS.get(settings["output"], "Auto")
-    return (
-        "⚙️ Settings\n\n"
-        f"Resolution: {resolution}\n"
-        f"Quality: {quality[0]} (CRF {quality[1]})\n"
-        f"Output: {output}\n\n"
-        "Resolution never upscales. Output Auto keeps the input type."
-    )
-
-
-def settings_kb(state: dict) -> list:
-    settings = state["settings"]
-    resolution = resolution_label(settings["resolution"])
-    quality = QUALITIES.get(settings["quality"], ("Balanced", 28))[0]
-    output = OUTPUT_LABELS.get(settings["output"], "Auto")
-    return [
-        [btn(f"Resolution · {resolution}", "setmenu:res", "primary")],
-        [btn(f"Quality · {quality}", "setmenu:quality", "primary")],
-        [btn(f"Output · {output}", "setmenu:output", "primary")],
-        [btn("⬅️ Back", "menu:main")],
-    ]
-
-
-def choice_kb(options: list, current: str, prefix: str) -> list:
-    items = [
-        btn(
-            ("✅ " if key == current else "") + label,
-            f"{prefix}{key}",
-            "success" if key == current else None,
-        )
-        for key, label in options
-    ]
-    rows = [items[i : i + 2] for i in range(0, len(items), 2)]
-    rows.append([btn("⬅️ Back", "menu:settings")])
-    return rows
-
-
-def queue_text(state: dict) -> str:
-    items = state["queue"]
-    total = sum(item["size"] for item in items) / 1048576
-    lines = [f"📚 Batch — {len(items)} video(s), {total:.1f} MB"]
-    if items:
-        lines.append("")
-    for number, item in enumerate(items[:15], 1):
-        lines.append(
-            f"{number}. {short(item['name'], 32)} — "
-            f"{item['size'] / 1048576:.1f} MB"
-        )
-    if len(items) > 15:
-        lines.append(f"…and {len(items) - 15} more")
-    lines += [
-        "",
-        f"Settings: {settings_line(state['settings'])}",
-        "",
-        "Send more videos, then tap ✅ Done.",
-    ]
-    return "\n".join(lines)
-
-
-def queue_kb(state: dict) -> list:
-    return [
-        [
-            btn("✅ Done", "multi:done", "success"),
-            btn("🗑 Clear", "multi:clear", "danger"),
-        ],
-        [btn("⚙️ Settings", "menu:settings"), btn("🏠 Menu", "menu:main")],
-    ]
-
-
-def result_kb() -> list:
-    return [
-        [btn("🔁 Another video", "menu:single", "primary")],
-        [btn("⚙️ Settings", "menu:settings"), btn("🏠 Menu", "menu:main")],
-    ]
-
-
-def new_batch_kb() -> list:
-    return [
-        [btn("🔁 New batch", "menu:multi", "primary")],
-        [btn("⚙️ Settings", "menu:settings"), btn("🏠 Menu", "menu:main")],
-    ]
-
-
-def start_batch(
-    state: dict,
-    user_id: int,
-    chat_id: int,
-    menu_id: int,
-    deadline: float | None,
-) -> str | None:
+def start_batch(state: dict, deadline: float | None = None) -> str | None:
     if state["processing"]:
-        return "A batch is still processing."
+        return "A batch is already running."
     if not state["queue"]:
         return "Queue is empty. Send videos first."
     if deadline and time.time() + 120 > deadline:
-        return "The shift is ending. Try after the next shift starts."
-    items = list(state["queue"])
+        return "The shift is ending. Start after the next shift."
+    state["working"] = [dict(item, status="queued") for item in state["queue"]]
     state["queue"] = []
     state["processing"] = True
     state["cancel"] = False
-    state["menu"] = (chat_id, menu_id)
+    state["view"] = "main"
+    state["summary"] = ""
     thread = threading.Thread(
-        target=process_batch,
-        args=(user_id, chat_id, menu_id, items, dict(state["settings"]), deadline),
-        daemon=True,
+        target=process_batch, args=(state["user_id"], dict(state["settings"]), deadline), daemon=True
     )
     with STATE_LOCK:
         JOBS.add(thread)
     thread.start()
+    save_state()
     return None
 
 
-def process_batch(
-    user_id: int,
-    chat_id: int,
-    menu_id: int,
-    items: list,
-    settings: dict,
-    deadline: float | None = None,
-) -> None:
-    state = get_state(user_id, chat_id)
+def process_batch(user_id: int, settings: dict, deadline: float | None = None) -> None:
+    state = get_state(user_id)
+    items = state.get("working", [])
     total = len(items)
-    stats = {
-        "ok": 0,
-        "failed": 0,
-        "in": 0.0,
-        "out": 0.0,
-        "cancelled": False,
-        "deferred": False,
-        "remaining": [],
-    }
+    state_in = state_out = 0.0
+    failed = cancelled = deferred = False
     index = 0
     try:
         for index, item in enumerate(items):
             if state.get("cancel"):
-                stats["cancelled"] = True
-                stats["remaining"].extend(items[index:])
+                cancelled = True
                 break
             duration = float(item.get("duration") or 0)
             if deadline and time.time() + duration + 120 > deadline:
-                stats["deferred"] = True
-                stats["remaining"].extend(items[index:])
+                deferred = True
+                item["status"] = "⏳ shift ended"
                 break
-            render_text(
-                chat_id,
-                menu_id,
-                f"⚙️ Processing {index + 1}/{total} — {short(item['name'])}\n\n"
-                "Cancel stops after the current video.",
-                [
-                    [btn("✖️ Cancel", "multi:cancel", "danger")],
-                    [btn("🏠 Menu", "menu:main")],
-                ],
-            )
             try:
                 result = compress_one(
-                    chat_id,
+                    item["chat_id"],
                     item["message_id"],
                     item["media"],
                     item["kind"],
@@ -1255,61 +1296,56 @@ def process_batch(
                     deadline=deadline,
                     path=item.get("path"),
                     filename=item["filename"],
+                    report=make_report(state, item),
                 )
             except Defer:
                 item["path"] = None
-                stats["deferred"] = True
-                stats["remaining"].extend(items[index:])
+                deferred = True
                 break
+            item["path"] = None
             if "error" in result:
-                item["path"] = None
-                stats["failed"] += 1
-                stats["remaining"].append(item)
+                failed = True
+                item["status"] = f"❌ {result['error']}"[:120]
             else:
-                stats["ok"] += 1
-                stats["in"] += result["in"]
-                stats["out"] += result["out"]
-    except Exception as exc:  # noqa: BLE001 - keep the rest of the queue
+                item["delivered"] = True
+                state_in += result["in"]
+                state_out += result["out"]
+            card_refresh(state, force=False)
+    except Exception as exc:  # noqa: BLE001 - keep the rest queued
         print(f"batch: {redact(exc)}", flush=True)
-        stats["remaining"].extend(items[index:])
-    finally:
-        with STATE_LOCK:
-            state["queue"] = stats["remaining"] + state["queue"]
-            state["processing"] = False
-            state["cancel"] = False
-        done = stats["ok"] + stats["failed"]
-        if stats["cancelled"]:
-            head = f"⏹ Cancelled — {done}/{total} processed."
-        elif stats["deferred"]:
-            head = f"⏳ Shift ending — {done}/{total} processed."
-        elif stats["failed"] and not stats["ok"]:
-            head = f"❌ Batch failed — {stats['failed']} error(s)."
-        else:
-            head = f"✅ Batch complete — {stats['ok']}/{total} compressed."
-        body = ""
-        if stats["in"]:
-            saved = 100 * (1 - stats["out"] / stats["in"])
-            body += (
-                f"\n{stats['in']:.1f} MB → {stats['out']:.1f} MB "
-                f"({saved:.0f}% smaller)."
-            )
-        if stats["failed"]:
-            body += f"\n❌ {stats['failed']} failed. Tap ✅ Done to retry."
-        if stats["deferred"]:
-            body += "\nSend the remaining videos again after the next shift starts."
-        if stats["cancelled"] and state["queue"]:
-            body += "\nTap ✅ Done to continue."
-        try:
-            render_text(
-                chat_id,
-                menu_id,
-                head + body,
-                queue_kb(state) if state["queue"] else new_batch_kb(),
-            )
-        except Exception as exc:  # noqa: BLE001 - summary is best effort
-            print(f"batch summary: {redact(exc)}", flush=True)
-        with STATE_LOCK:
-            JOBS.discard(threading.current_thread())
+    done = state_in and True
+    delivered = sum(1 for i in items if i.get("delivered"))
+    errors = [i for i in items if (i.get("status") or "").startswith("❌")]
+    kept = [i for i in items if not i.get("delivered")]
+    with STATE_LOCK:
+        state["working"] = []
+        state["queue"] = kept + state["queue"]
+        state["processing"] = False
+        state["cancel"] = False
+        state["view"] = "main"
+    pieces = []
+    if cancelled:
+        pieces.append(f"⏹ Cancelled — {delivered}/{total} delivered.")
+    elif deferred:
+        pieces.append(f"⏳ Shift ending — {delivered}/{total} delivered.")
+    elif failed and not delivered:
+        pieces.append(f"❌ Batch failed — {total} error(s).")
+    else:
+        pieces.append(f"✅ Delivered {delivered}/{total}.")
+    if state_in:
+        saved = 100 * (1 - state_out / state_in)
+        pieces.append(f"{state_in:.1f} MB → {state_out:.1f} MB ({saved:.0f}% smaller).")
+    if errors:
+        pieces.append(f"{len(errors)} failed — tap ▶️ Start to retry.")
+    if deferred:
+        pieces.append("Send remaining videos again after the next shift.")
+    state["summary"] = " ".join(pieces)
+    try:
+        card_refresh(state, force=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"batch summary: {redact(exc)}", flush=True)
+    with STATE_LOCK:
+        JOBS.discard(threading.current_thread())
 
 
 def handle_callback(cq: dict, deadline: float | None = None) -> None:
@@ -1319,7 +1355,6 @@ def handle_callback(cq: dict, deadline: float | None = None) -> None:
     username = user.get("username") or ""
     message = cq.get("message") or {}
     chat_id = (message.get("chat") or {}).get("id")
-    message_id = message.get("message_id")
     data = cq.get("data") or ""
     answered = False
 
@@ -1339,123 +1374,66 @@ def handle_callback(cq: dict, deadline: float | None = None) -> None:
             print(f"answerCallbackQuery: {redact(exc)}", flush=True)
 
     try:
-        if not is_allowed(user_id, username):
-            answer(f"Private bot. Your ID: {whoami(user_id, username)}", True)
-            return
-        if chat_id is None or message_id is None:
-            answer("This menu is outdated. Send /start.", True)
-            return
+        if ALLOWED and user_id not in ALLOWED:
+            if not is_allowed(user_id, username):
+                answer(f"Private bot. Your ID: {whoami(user_id, username)}", True)
+                return
         state = get_state(user_id, chat_id)
         settings = state["settings"]
         if data == "menu:main":
+            state["view"] = "main"
             state["mode"] = "single"
-            render_text(chat_id, message_id, main_text(state), main_kb(state))
-        elif data == "menu:help":
-            render_text(
-                chat_id, message_id, HELP, [[btn("⬅️ Back", "menu:main")]]
-            )
         elif data == "menu:single":
             state["mode"] = "single"
-            render_text(
-                chat_id,
-                message_id,
-                "🎬 Single video\n\n"
-                "Send one video, round video message, or video file.\n"
-                f"Settings: {settings_line(settings)}",
-                [
-                    [
-                        btn("⚙️ Settings", "menu:settings"),
-                        btn("🏠 Menu", "menu:main"),
-                    ]
-                ],
-            )
-            answer("Send a video")
+            state["view"] = "main"
         elif data == "menu:multi":
-            if state["processing"]:
-                answer("A batch is still processing.", True)
-            else:
-                state["mode"] = "multi"
-                menu_id = render_text(
-                    chat_id, message_id, queue_text(state), queue_kb(state)
-                )
-                state["menu"] = (chat_id, menu_id)
-                answer()
+            state["mode"] = "batch"
+            state["view"] = "main"
         elif data == "menu:settings":
-            render_text(
-                chat_id, message_id, settings_text(state), settings_kb(state)
-            )
+            state["view"] = "settings"
+        elif data == "menu:help":
+            state["view"] = "help"
         elif data == "setmenu:res":
-            render_text(
-                chat_id,
-                message_id,
-                "📐 Resolution\n\nLong side cap. Original keeps the source size.",
-                choice_kb(RESOLUTIONS, settings["resolution"], "set:res:"),
-            )
+            state["view"] = "res"
         elif data == "setmenu:quality":
-            options = [
-                (key, f"{value[0]} (CRF {value[1]})")
-                for key, value in QUALITIES.items()
-            ]
-            render_text(
-                chat_id,
-                message_id,
-                "🎚 Quality\n\nHigher quality means a bigger file.",
-                choice_kb(options, settings["quality"], "set:q:"),
-            )
+            state["view"] = "quality"
         elif data == "setmenu:output":
-            render_text(
-                chat_id,
-                message_id,
-                "📦 Output\n\nAuto sends the same kind of message you sent.",
-                choice_kb(OUTPUTS, settings["output"], "set:out:"),
-            )
+            state["view"] = "output"
         elif data.startswith("set:res:"):
             value = data.split(":", 2)[2]
             if value not in RESOLUTION_LABELS:
-                answer("Unknown setting.", True)
-            else:
-                settings["resolution"] = value
-                render_text(
-                    chat_id, message_id, settings_text(state), settings_kb(state)
-                )
-                answer(f"Resolution: {RESOLUTION_LABELS[value]}")
+                answer("Unknown option.", True)
+                return
+            settings["resolution"] = value
+            state["view"] = "settings"
         elif data.startswith("set:q:"):
             value = data.split(":", 2)[2]
             if value not in QUALITIES:
-                answer("Unknown setting.", True)
-            else:
-                settings["quality"] = value
-                render_text(
-                    chat_id, message_id, settings_text(state), settings_kb(state)
-                )
-                answer(f"Quality: {QUALITIES[value][0]}")
+                answer("Unknown option.", True)
+                return
+            settings["quality"] = value
+            state["view"] = "settings"
         elif data.startswith("set:out:"):
             value = data.split(":", 2)[2]
             if value not in OUTPUT_LABELS:
-                answer("Unknown setting.", True)
-            else:
-                settings["output"] = value
-                render_text(
-                    chat_id, message_id, settings_text(state), settings_kb(state)
-                )
-                answer(f"Output: {OUTPUT_LABELS[value]}")
+                answer("Unknown option.", True)
+                return
+            settings["output"] = value
+            state["view"] = "settings"
         elif data == "multi:done":
-            menu = state.get("menu")
-            menu_id = menu[1] if menu and menu[0] == chat_id else message_id
-            error = start_batch(state, user_id, chat_id, menu_id, deadline)
+            error = start_batch(state, deadline)
             answer(error or "Starting…", alert=bool(error))
+            card_refresh(state, force=True)
+            return
         elif data == "multi:clear":
             if state["processing"]:
-                answer("A batch is still processing.", True)
-            else:
-                for item in state["queue"]:
-                    safe_unlink(item.get("path"))
-                state["queue"].clear()
-                menu_id = render_text(
-                    chat_id, message_id, queue_text(state), queue_kb(state)
-                )
-                state["menu"] = (chat_id, menu_id)
-                answer("Queue cleared")
+                answer("Wait for the batch to finish.", True)
+                return
+            for item in state["queue"]:
+                safe_unlink(item.get("path"))
+            state["queue"].clear()
+            state["summary"] = ""
+            state["note"] = ""
         elif data == "multi:cancel":
             if state["processing"]:
                 state["cancel"] = True
@@ -1464,6 +1442,8 @@ def handle_callback(cq: dict, deadline: float | None = None) -> None:
                 answer("Nothing is running.")
         else:
             answer("This menu is outdated. Send /start.", True)
+            return
+        card_refresh(state, force=True)
     finally:
         answer()
 
@@ -1475,49 +1455,37 @@ def handle(message: dict, deadline: float | None = None) -> None:
     user_id = user.get("id")
     username = user.get("username") or ""
 
-    if not is_allowed(user_id, username):
-        api(
-            "sendMessage",
-            chat_id=chat_id,
-            text=(
-                "This bot is private.\n"
-                f"Your user ID: {whoami(user_id, username)}\n"
-                "Ask the owner to add it to ALLOWED_USER_IDS or ALLOWED_USERNAMES."
-            ),
-            reply_parameters=reply_params(message_id),
-        )
-        return
+    if ALLOWED and user_id not in ALLOWED:
+        if not is_allowed(user_id, username):
+            api(
+                "sendMessage",
+                chat_id=chat_id,
+                text=(
+                    "This bot is private.\n"
+                    f"Your user ID: {whoami(user_id, username)}\n"
+                    "Ask the owner to add it to ALLOWED_USER_IDS or ALLOWED_USERNAMES."
+                ),
+                reply_parameters=reply_params(message_id),
+            )
+            return
 
-    text = (message.get("text") or "").strip()
     state = get_state(user_id, chat_id)
+    text = (message.get("text") or "").strip()
 
     if text.startswith("/start"):
         state["mode"] = "single"
-        api(
-            "sendMessage",
-            chat_id=chat_id,
-            text=main_text(state),
-            reply_markup=markup(main_kb(state)),
-            reply_parameters=reply_params(message_id),
-        )
+        state["view"] = "main"
+        state["note"] = ""
+        state["menu"] = None  # fresh card
+        card_refresh(state, force=True)
         return
     if text.startswith("/help"):
-        api(
-            "sendMessage",
-            chat_id=chat_id,
-            text=HELP,
-            reply_markup=markup([[btn("🏠 Menu", "menu:main")]]),
-            reply_parameters=reply_params(message_id),
-        )
+        state["view"] = "help"
+        card_refresh(state, force=True)
         return
     if text.startswith("/settings"):
-        api(
-            "sendMessage",
-            chat_id=chat_id,
-            text=settings_text(state),
-            reply_markup=markup(settings_kb(state)),
-            reply_parameters=reply_params(message_id),
-        )
+        state["view"] = "settings"
+        card_refresh(state, force=True)
         return
     if text.startswith("/id"):
         api(
@@ -1530,41 +1498,16 @@ def handle(message: dict, deadline: float | None = None) -> None:
     if text.lower() in ("/cancel", "cancel"):
         if state["processing"]:
             state["cancel"] = True
-            reply = "Stopping after the current video."
-        elif state["queue"]:
-            state["mode"] = "single"
-            reply = "Cancelled. Your queue is kept; open Multiple videos to resume."
+            state["note"] = "Stopping after the current video."
         else:
-            reply = "Nothing is running."
-        api(
-            "sendMessage",
-            chat_id=chat_id,
-            text=reply,
-            reply_parameters=reply_params(message_id),
-        )
+            state["mode"] = "single"
+            state["note"] = ""
+        card_refresh(state, force=True)
         return
     if text.lower() in ("done", "/done", "✅ done"):
-        if state["processing"]:
-            reply = "A batch is still processing."
-        elif not state["queue"]:
-            reply = "Queue is empty. Send videos first."
-        else:
-            menu = state.get("menu")
-            if menu:
-                menu_id = menu[1]
-            else:
-                sent = api(
-                    "sendMessage", chat_id=chat_id, text="⚙️ Starting batch…"
-                )
-                menu_id = sent["message_id"]
-            error = start_batch(state, user_id, chat_id, menu_id, deadline)
-            reply = error or "Starting…"
-        api(
-            "sendMessage",
-            chat_id=chat_id,
-            text=reply,
-            reply_parameters=reply_params(message_id),
-        )
+        error = start_batch(state, deadline)
+        state["note"] = error or ""
+        card_refresh(state, force=True)
         return
 
     found = pick_media(message)
@@ -1573,7 +1516,6 @@ def handle(message: dict, deadline: float | None = None) -> None:
             "sendMessage",
             chat_id=chat_id,
             text="Send a video, a round video message, or a video file.",
-            reply_markup=markup([[btn("🏠 Menu", "menu:main")]]),
             reply_parameters=reply_params(message_id),
         )
         return
@@ -1581,19 +1523,17 @@ def handle(message: dict, deadline: float | None = None) -> None:
     media, kind = found
     size = int(media.get("file_size") or 0)
     duration = float(media.get("duration") or 0)
-    input_cap = MT_UPLOAD_LIMIT if mt_ready() else MAX_INPUT_MB * 1024 * 1024
-    if size > input_cap:
+    if size > mt_input_limit_bytes():
         if mt_ready():
             reason = (
                 f"This video is {size / 1048576:.0f} MB; the MTProto bot cap is "
-                f"~2000 MB. Split it into parts and send them in a batch."
+                "~2000 MB. Split it and send the parts."
             )
         else:
             reason = (
                 f"This video is {size / 1048576:.1f} MB. Telegram's cloud Bot API "
-                f"only lets bots download files up to {MAX_INPUT_MB} MB. "
-                "Set the TELEGRAM_API_ID and TELEGRAM_API_HASH secrets to "
-                "unlock ~2 GB, or send a shorter clip."
+                f"caps downloads at {MAX_INPUT_MB} MB. Set the TELEGRAM_API_ID and "
+                "TELEGRAM_API_HASH secrets to unlock ~2 GB, or send a shorter clip."
             )
         api(
             "sendMessage",
@@ -1606,69 +1546,77 @@ def handle(message: dict, deadline: float | None = None) -> None:
         api(
             "sendMessage",
             chat_id=chat_id,
-            text="⏳ Wait for the current batch to finish, or send /cancel.",
+            text="⏳ The batch is still running — videos after ✖️ Cancel start a new batch.",
             reply_parameters=reply_params(message_id),
         )
         return
 
-    if state["mode"] == "multi":
-        name = media_name(media, kind)
-        item = {
-            "media": media,
-            "kind": kind,
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "size": size,
-            "name": short(name),
-            "filename": filename_for(media, kind),
-            "path": None,
-            "duration": duration,
-        }
-        sent = api(
-            "sendMessage",
-            chat_id=chat_id,
-            text=f"⏳ Adding {short(name)}…",
-            reply_parameters=reply_params(message_id),
-        )
-        menu_id = sent["message_id"]
-        reporter = ProgressReporter(chat_id, menu_id)
-        reporter.text = f"⏳ Adding {short(name)}…"
-        error = cache_item(item, state["queue"], reporter)
-        if error:
-            render_text(
-                chat_id,
-                menu_id,
-                f"❌ {error}",
-                [[btn("🏠 Menu", "menu:main")]],
-            )
-            return
+    item = {
+        "media": media,
+        "kind": kind,
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "size": size,
+        "name": short(media_name(media, kind)),
+        "filename": filename_for(media, kind),
+        "path": None,
+        "duration": duration,
+        "status": "",
+        "delivered": False,
+    }
+
+    if state["mode"] == "batch":
+        report = make_report(state, item)
+        report("⏳ downloading")
         state["queue"].append(item)
-        state["menu"] = (chat_id, menu_id)
-        render_text(chat_id, menu_id, queue_text(state), queue_kb(state))
+        card_refresh(state, force=True)
+        others = [q for q in state["queue"] if q is not item]
+        error = cache_item(item, others, lambda pct: report("⏳ downloading", pct))
+        if error:
+            safe_unlink(item.get("path"))
+            state["queue"].remove(item)
+            state["note"] = f"❌ {error}"
+            card_refresh(state, force=True)
+            return
+        item["status"] = ""
+        state["note"] = ""
+        card_refresh(state, force=True)
         return
 
     if deadline and duration and time.time() + duration + 120 > deadline:
-        api(
-            "sendMessage",
-            chat_id=chat_id,
-            text="⏳ Not enough time left in this shift.",
-            reply_parameters=reply_params(message_id),
-        )
+        state["note"] = "⏳ Not enough time left in this shift; queued for the next."
+        card_refresh(state, force=True)
         raise Defer
 
+    state["working"] = [item]
     state["processing"] = True
+    card_refresh(state, force=True)
     try:
-        compress_one(
+        result = compress_one(
             chat_id,
             message_id,
             media,
             kind,
-            dict(state["settings"]),
+            state["settings"],
             deadline=deadline,
-            keyboard=result_kb(),
+            report=make_report(state, item),
         )
+        if "error" in result:
+            item["status"] = f"❌ {result['error']}"[:120]
+    except Defer:
+        state["working"] = []
+        state["processing"] = False
+        state["note"] = "⏳ Shift too short — send it again after the next shift starts."
+        card_refresh(state, force=True)
+        raise
     finally:
         state["processing"] = False
+    state["working"] = []
+    if "error" not in result:
+        state["note"] = ""
+    else:
+        state["note"] = f"{result['error']}"[:180]
+    card_refresh(state, force=True)
 
 
 def main() -> None:
@@ -1687,8 +1635,10 @@ def main() -> None:
             "anyone can use this bot.",
             flush=True,
         )
+    load_state()
     print(
-        f"Bot started. API={API_BASE} shift={RUN_SECONDS}s reserve={RESERVE_SECONDS}s",
+        f"Bot started. API={API_BASE} shift={RUN_SECONDS}s "
+        f"reserve={RESERVE_SECONDS}s mtproto={mt_ready()}",
         flush=True,
     )
     try:
@@ -1736,12 +1686,12 @@ def main() -> None:
                         print(f"callback: {redact(exc)}", flush=True)
                     except Exception as exc:  # noqa: BLE001
                         print(
-                            f"callback: unexpected {type(exc).__name__}: "
-                            f"{redact(exc)}",
+                            f"callback: unexpected {type(exc).__name__}: {redact(exc)}",
                             flush=True,
                         )
                 offset = update["update_id"] + 1
     finally:
+        save_state()
         with STATE_LOCK:
             jobs = list(JOBS)
         stop = started + RUN_SECONDS

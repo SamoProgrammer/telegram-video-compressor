@@ -19,6 +19,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Restore bot state
+        uses: actions/cache@v4
+        with:
+          path: /tmp/bot-state.json
+          key: bot-state-${{ github.run_id }}
+          restore-keys: |
+            bot-state-
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -58,3 +66,4 @@ jobs:
           MAX_OUTPUT_MB: "50"
           MAX_DURATION: "3600"
           DISK_BUDGET_MB: "2048"
+          BOT_STATE_FILE: "/tmp/bot-state.json"
