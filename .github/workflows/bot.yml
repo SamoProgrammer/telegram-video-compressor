@@ -45,4 +45,6 @@ jobs:
           BOT_RUN_SECONDS: "19500"
           BOT_RESERVE_SECONDS: "300"
           MAX_INPUT_MB: "20"
+          MAX_OUTPUT_MB: "50"
           MAX_DURATION: "3600"
+          DISK_BUDGET_MB: "2048"

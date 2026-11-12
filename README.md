@@ -27,15 +27,28 @@ So the news is real, but it is a bot backend host, not a video-processing servic
 
 One Python bot and one GitHub Actions workflow:
 
-1. Long-polls Telegram for updates.
-2. Downloads a forwarded video, round video message, or video document.
-3. Compresses it with ffmpeg:
+1. Long-polls Telegram for messages and button presses.
+2. Shows a menu: **Single video** or **Multiple videos**, plus settings.
+3. Downloads a forwarded video, round video message, or video document.
+4. Compresses it with ffmpeg:
    - H.264 High profile, `yuv420p`, `+faststart`
-   - 720p max (1280 px long side), 480×480 for round video notes
-   - CRF 28 (30 for notes), `veryfast`, AAC 96 kbps
+   - default 720p max (1280 px long side), 480×480 for round video notes
+   - default CRF 28, `veryfast`, AAC 96 kbps
    - metadata and chapters stripped
-4. Sends it back as the same kind of message.
-5. If compression does not save at least 2%, sends the original by `file_id` (no re-upload).
+5. Sends it back as the chosen output type (Auto keeps the input type).
+6. If compression does not save at least 2%, sends the original by `file_id` (no re-upload).
+
+In multi mode the bot queues every video, downloads it eagerly, and waits for **✅ Done**. While adding a video, if the batch would exceed the disk budget, the oldest cached file is deleted from disk and re-downloaded when its turn comes. The batch is processed sequentially with progress, cancel, retry, and a final size summary.
+
+Settings (all available as buttons):
+
+| Setting | Values |
+|---|---|
+| Resolution | Original, 2160p, 1440p, 1080p, 720p, 480p, 360p, 240p |
+| Quality | High (CRF 22), Balanced (CRF 28), Small (CRF 33) |
+| Output | Auto (same as input), Video, Document, Round video |
+
+Round video output crops to a square and falls back to a regular video when the clip is longer than 60 seconds. Colored buttons use Bot API `style` (`primary`, `success`, `danger`); older clients simply render them unstyled.
 
 Architecture:
 
@@ -63,13 +76,25 @@ GitHub's Actions terms restrict use to the production, testing, deployment, or p
    - Get it from [@userinfobot](https://t.me/userinfobot), or leave the variable empty for the first run and send `/id` to your bot.
    - If empty, anyone can use your bot and burn your runner time.
 5. Open the **Actions** tab, enable workflows, select `telegram-video-compressor`, and click **Run workflow**.
-6. Send or forward a video to your bot.
+6. Open the bot and send `/start`; tap **Single video** or **Multiple videos**.
+
+## Using the bot
+
+- **Single video** — send one video and get the compressed result with another-video/settings/menu buttons.
+- **Multiple videos** — send all videos first. Each one is downloaded into the batch. Tap **✅ Done** (or send `done`) to start; the bot processes them one by one and posts a summary with total savings.
+- **Settings** — resolution, quality, and output menus. The current value is marked ✅.
+- **Cancel** — the red cancel button during a batch stops after the current video and keeps the rest in the queue. `Clear` deletes the queue.
+- **Retry** — failed videos stay in the queue; tap **✅ Done** again to retry them.
+- **Disk budget** — `DISK_BUDGET_MB` (default 2048) caps the batch cache. When a new video does not fit, the oldest cached file is deleted and downloaded again when its turn comes.
+- **Stale menus** — old buttons answer with "This menu is outdated" instead of doing the wrong thing.
+
+Batch queues live in the runner's memory, so finish a batch within one shift. If the shift ends mid-batch, the videos already confirmed to the bot must be sent again after the next shift starts. Single videos that arrive too late are left unconfirmed and Telegram redelivers them next shift.
 
 ### Shift schedule
 
 The workflow runs every 5 hours (`7 */5 * * *`, minute 7 to avoid the top-of-the-hour scheduling rush). Each job works for 5 h 20 min, leaving a buffer under the workflow's 350-minute timeout. The next run is queued before the current one ends, so the handoff is usually a few seconds.
 
-If a video arrives too close to the end of a shift, the bot replies "Queued for the next free shift" and leaves the update unconfirmed. Telegram keeps updates for 24 hours, so the next shift picks it up.
+If a single video arrives too close to the end of a shift, the bot replies "Not enough time left in this shift" and leaves the update unconfirmed. Telegram keeps updates for 24 hours, so the next shift picks it up.
 
 ### GitHub Actions limits
 
@@ -85,8 +110,9 @@ If a video arrives too close to the end of a shift, the bot replies "Queued for 
 | Limit | Value | Why |
 |---|---|---|
 | Input size | 20 MB | Cloud Bot API `getFile` cap |
-| Output size | 50 MB | Cloud Bot API upload cap |
+| Output size | 50 MB (`MAX_OUTPUT_MB`) | Cloud Bot API upload cap |
 | Duration | 1 hour | Keeps a shift from overrunning |
+| Batch cache | 2 GB (`DISK_BUDGET_MB`) | Oldest cached file is evicted first |
 | Work shift | 5 h 20 min | GitHub Actions 6-hour job cap |
 | Update retention | 24 hours | Telegram retention |
 
@@ -116,7 +142,7 @@ telegram-bot-api --local --api-id=<API_ID> --api-hash=<API_HASH> \
 
 # Start the bot against it
 BOT_TOKEN=<YOUR_TOKEN> BOT_API_URL=http://127.0.0.1:8081 \
-  MAX_INPUT_MB=2000 MAX_DURATION=7200 python bot.py
+  MAX_INPUT_MB=2000 MAX_OUTPUT_MB=2000 MAX_DURATION=7200 python bot.py
 ```
 
 For a quick local test, add `BOT_RUN_SECONDS=120` so the bot exits after two minutes. To move the bot back to the cloud Bot API later, call `curl "http://127.0.0.1:8081/bot<YOUR_TOKEN>/logOut"` before stopping the local server.
@@ -160,14 +186,14 @@ The Worker answers the user immediately, then triggers one Actions run per video
 
 - The repository must be public for free Actions minutes. Never put the bot token in code; use the `BOT_TOKEN` secret.
 - Set `ALLOWED_USER_IDS`; otherwise anyone can use your bot.
-- The runner is ephemeral. Downloaded videos are deleted at the end of the shift.
+- The runner is ephemeral. Cloud-downloaded videos are deleted when processed or at the end of the shift. A local Bot API server manages its own `--dir`.
 - This is hobby-scale infrastructure. See the terms-of-use reality check above; don't run a public high-volume service on GitHub Actions.
 - ffmpeg parses untrusted media. Keep the runner image updated, and keep the 20 MB / 1 hour caps.
 - The bot redacts the token from errors. GitHub also masks repository secrets in logs.
 
 ## Files
 
-- `bot.py` — the bot.
+- `bot.py` — the bot, menus, batch queue, and ffmpeg pipeline.
 - `test_bot.py` — unit tests plus a real ffmpeg smoke test (`python -m unittest -v`).
 - `.github/workflows/bot.yml` — free 5-hour shifts.
 - `Dockerfile` — optional local/VPS run.
@@ -178,6 +204,9 @@ The Worker answers the user immediately, then triggers one Actions run per video
 - **Bot does not answer:** check the Actions run; make sure the workflow is enabled and `BOT_TOKEN` is set. Run it manually once.
 - **`Conflict: terminated by other getUpdates request`:** two runs overlapped. The concurrency group prevents this; wait for the old run to finish.
 - **"file is too big":** the video is over 20 MB. Use a round video message, a shorter clip, or local Bot API mode.
+- **Buttons look plain:** colored buttons need a current Telegram client. Older clients ignore `style`; the buttons still work.
+- **My batch disappeared after a shift:** batch queues are in runner memory. Send the videos again after the next shift starts.
+- **Round video output arrived as a regular video:** clips longer than 60 seconds cannot be video notes, so the bot falls back.
 - **Scheduled workflow stopped after 60 days:** GitHub disables scheduled workflows in inactive public repositories. Re-enable it in the Actions tab and push a commit; GitHub counts commits, not scheduled runs, as activity.
 - **Private repository:** included compute is $12/month (~33 Linux hours); 24/7 shifts will hit the limit. Make the repository public.
 
@@ -186,6 +215,8 @@ The Worker answers the user immediately, then triggers one Actions run per video
 - Telegram Serverless: <https://core.telegram.org/bots/serverless> (launched July 2026; docs updated 6 October 2026)
 - Launch coverage: <https://habr.com/ru/articles/1059556/> (15 July 2026) and <https://www.techtimes.com/articles/320758/20260716/telegram-serverless-ships-one-deploy-command-your-bot-data-never-leaves-telegram.htm> (16 July 2026)
 - Bot API file limits: <https://core.telegram.org/bots/api#sending-files> and <https://core.telegram.org/bots/api/methods/getfile>
+- Colored inline buttons: <https://core.telegram.org/bots/api/types/inlinekeyboardbutton>
+- Video note limits: <https://core.telegram.org/bots/api/methods/sendvideonote>
 - Local Bot API server: <https://github.com/tdlib/telegram-bot-api>
 - GitHub Actions billing: <https://docs.github.com/en/billing/concepts/product-billing/github-actions>
 - GitHub Actions limits: <https://docs.github.com/en/actions/reference/limits>
