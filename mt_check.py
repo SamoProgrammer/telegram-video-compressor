@@ -17,6 +17,12 @@ async def main() -> int:
         return 0
     client = TelegramClient("mt-check", api_id, api_hash)
     await client.start(bot_token=token)
+    try:
+        import cryptg
+
+        print("cryptg present (fast AES).")
+    except ImportError:
+        print("WARNING: cryptg missing; downloads will be slow.")
     me = await client.get_me()
     print(f"MTProto OK: logged in as @{me.username} (bot id {me.id})")
     await client.disconnect()

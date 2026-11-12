@@ -481,6 +481,15 @@ class MtprotoTest(unittest.TestCase):
         texts = [params.get("text", "") for method, params in self.calls if method == "sendMessage"]
         self.assertTrue(texts and "2000 MB" in texts[0])
 
+    def test_region_plan(self):
+        single = bot.mt_regions(10 * 1024 * 1024)
+        self.assertEqual(single, [(0, 10 * 1024 * 1024)])
+        plan = bot.mt_regions(100 * 1024 * 1024)
+        self.assertEqual(len(plan), 3)
+        self.assertEqual(sum(length for _, length in plan), 100 * 1024 * 1024)
+        for start, length in plan:
+            self.assertEqual(start % (512 * 1024), 0)
+
     def test_download_reraises_other_errors(self):
         self.set_creds(True)
 
