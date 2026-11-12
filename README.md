@@ -44,9 +44,13 @@ Telegram cloud Bot API  <->  GitHub Actions runner (ffmpeg, 5-hour shifts)
 ```
 
 - GitHub Actions standard runners are free for **public** repositories. No payment method needed.
-- Private repositories get 2,000 free minutes/month (~33 hours), which is not enough for 24/7.
+- Private repositories get $12/month of included compute (~2,000 Linux minutes, ~33 hours), which is not enough for 24/7.
 - Telegram Bot API is free.
 - No server, database, or persistent storage.
+
+### Terms-of-use reality check
+
+GitHub's Actions terms restrict use to the production, testing, deployment, or publication of the project in the repository, and prohibit activity that puts a disproportionate burden on their servers. A personal, low-volume bot is a low-burden deployment; a public bot serving many users 24/7 is not what Actions is for. GitHub can terminate jobs, disable the repository, or restrict the account. For a public service, run the bot on a machine you control (local Bot API mode below) or a host that permits bots.
 
 ## Quick start
 
@@ -66,6 +70,15 @@ Telegram cloud Bot API  <->  GitHub Actions runner (ffmpeg, 5-hour shifts)
 The workflow runs every 5 hours (`7 */5 * * *`, minute 7 to avoid the top-of-the-hour scheduling rush). Each job works for 5 h 20 min, leaving a buffer under the workflow's 350-minute timeout. The next run is queued before the current one ends, so the handoff is usually a few seconds.
 
 If a video arrives too close to the end of a shift, the bot replies "Queued for the next free shift" and leaves the update unconfirmed. Telegram keeps updates for 24 hours, so the next shift picks it up.
+
+### GitHub Actions limits
+
+- Public-repo standard runner: 4 vCPU, 16 GB RAM, 14 GB SSD, free and unlimited (subject to the terms above).
+- Job timeout: 6 hours; this workflow stops the bot at 5 h 20 min.
+- Queued run: discarded if GitHub does not pick it up within 45 minutes.
+- Scheduled runs are best-effort, can be delayed at busy times, and are disabled after 60 days without a commit.
+- Free plan: 20 concurrent jobs; this workflow uses one.
+- Private repo: $12/month of included compute (~2,000 Linux minutes), then usage is blocked without a payment method.
 
 ## Limits
 
@@ -124,7 +137,7 @@ Do **not** use a user-account (MTProto/Telethon) session to bypass the bot limit
 | Option | Free without a card? | Verdict |
 |---|---|---|
 | Telegram Serverless | Yes (launch period) | No ffmpeg/WASM, 20 MB download, no filesystem. Good for a webhook/queue, not encoding. |
-| GitHub Actions + ffmpeg | Yes, public repo | **Chosen.** Real CPU/RAM, ffmpeg, 6 h per job. |
+| GitHub Actions + ffmpeg | Yes, public repo | **Chosen for the free demo.** Real CPU/RAM, ffmpeg, 6 h per job; hobby-scale only (see terms). |
 | Hugging Face Spaces | CPU Basic is free; Docker Space hosting is a PRO feature | Free Spaces sleep/restart and are built for demos, not always-on polling. |
 | Cloudflare Workers + ffmpeg.wasm | Yes | 128 MB memory, no threads, 10 ms CPU on free. Not viable for video. |
 | Vercel Hobby + ffmpeg-static | Yes | Possible for very short clips, but a short function timeout and ~1 GB RAM; cold starts. |
@@ -148,7 +161,7 @@ The Worker answers the user immediately, then triggers one Actions run per video
 - The repository must be public for free Actions minutes. Never put the bot token in code; use the `BOT_TOKEN` secret.
 - Set `ALLOWED_USER_IDS`; otherwise anyone can use your bot.
 - The runner is ephemeral. Downloaded videos are deleted at the end of the shift.
-- This is hobby-scale infrastructure. Don't run a public high-volume service on GitHub Actions; it is not a CDN and may be rate-limited or disabled.
+- This is hobby-scale infrastructure. See the terms-of-use reality check above; don't run a public high-volume service on GitHub Actions.
 - ffmpeg parses untrusted media. Keep the runner image updated, and keep the 20 MB / 1 hour caps.
 - The bot redacts the token from errors. GitHub also masks repository secrets in logs.
 
@@ -166,7 +179,7 @@ The Worker answers the user immediately, then triggers one Actions run per video
 - **`Conflict: terminated by other getUpdates request`:** two runs overlapped. The concurrency group prevents this; wait for the old run to finish.
 - **"file is too big":** the video is over 20 MB. Use a round video message, a shorter clip, or local Bot API mode.
 - **Scheduled workflow stopped after 60 days:** GitHub disables scheduled workflows in inactive public repositories. Re-enable it in the Actions tab and push a commit; GitHub counts commits, not scheduled runs, as activity.
-- **Private repository:** free minutes are ~33 hours/month; 24/7 shifts will hit the quota. Make the repository public.
+- **Private repository:** included compute is $12/month (~33 Linux hours); 24/7 shifts will hit the limit. Make the repository public.
 
 ## Sources
 
@@ -174,5 +187,6 @@ The Worker answers the user immediately, then triggers one Actions run per video
 - Launch coverage: <https://habr.com/ru/articles/1059556/> (15 July 2026) and <https://www.techtimes.com/articles/320758/20260716/telegram-serverless-ships-one-deploy-command-your-bot-data-never-leaves-telegram.htm> (16 July 2026)
 - Bot API file limits: <https://core.telegram.org/bots/api#sending-files> and <https://core.telegram.org/bots/api/methods/getfile>
 - Local Bot API server: <https://github.com/tdlib/telegram-bot-api>
-- GitHub Actions billing: <https://docs.github.com/en/billing/managing-billing-for-your-products/managing-billing-for-github-actions/about-billing-for-github-actions>
+- GitHub Actions billing: <https://docs.github.com/en/billing/concepts/product-billing/github-actions>
 - GitHub Actions limits: <https://docs.github.com/en/actions/reference/limits>
+- GitHub Actions terms (purpose restrictions): <https://docs.github.com/en/site-policy/github-terms/github-terms-for-additional-products-and-features#actions>
