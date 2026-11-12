@@ -35,7 +35,7 @@ One Python bot and one GitHub Actions workflow:
    - CRF 28 (30 for notes), `veryfast`, AAC 96 kbps
    - metadata and chapters stripped
 4. Sends it back as the same kind of message.
-5. If the result is not smaller, sends the original by `file_id` (no re-upload).
+5. If compression does not save at least 2%, sends the original by `file_id` (no re-upload).
 
 Architecture:
 
