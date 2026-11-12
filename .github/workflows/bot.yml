@@ -37,6 +37,14 @@ jobs:
       - name: Self-check
         run: python -m unittest -v
 
+      - name: MTProto login check
+        if: ${{ secrets.TELEGRAM_API_ID != '' }}
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: python mt_check.py
+
       - name: Run bot shift
         run: python bot.py
         env:
