@@ -1,3 +1,4 @@
+import io
 import shutil
 import subprocess
 import tempfile
@@ -126,7 +127,7 @@ class HandleFlowTest(unittest.TestCase):
                 calls.append((method, files, params, size))
                 return {"message_id": 1}
 
-            def fake_download(file_id):
+            def fake_download(file_id, progress=None):
                 return src
 
             bot.api = fake_api
@@ -149,16 +150,10 @@ class HandleFlowTest(unittest.TestCase):
                 bot.download = original_download
 
             methods = [call[0] for call in calls]
-            self.assertEqual(
-                methods,
-                [
-                    "sendMessage",
-                    "editMessageText",
-                    "editMessageText",
-                    "sendVideo",
-                    "editMessageText",
-                ],
-            )
+            self.assertEqual(methods[0], "sendMessage")
+            self.assertEqual(methods[-1], "editMessageText")
+            self.assertIn("sendVideo", methods)
+            self.assertTrue(all(m != "sendMessage" for m in methods[1:-1]))
             video = next(call for call in calls if call[0] == "sendVideo")
             self.assertGreater(video[3], 0)
             self.assertEqual(video[2]["width"], 640)
@@ -241,7 +236,7 @@ class QueueTest(unittest.TestCase):
             originals = (bot.TMP, bot.DISK_BUDGET, bot.download, bot.probe)
             bot.TMP = tmp
             bot.DISK_BUDGET = 150
-            bot.download = lambda file_id: new
+            bot.download = lambda file_id, progress=None: new
             bot.probe = lambda path: {
                 "width": 640,
                 "height": 360,
@@ -266,7 +261,7 @@ class QueueTest(unittest.TestCase):
             item = {"media": {"file_id": "bad"}, "size": 11, "path": None, "name": "bad"}
             originals = (bot.TMP, bot.download, bot.probe)
             bot.TMP = tmp
-            bot.download = lambda file_id: bad
+            bot.download = lambda file_id, progress=None: bad
             bot.probe = lambda path: (_ for _ in ()).throw(
                 bot.BotError("No video stream found")
             )
@@ -299,7 +294,7 @@ class OutputLimitTest(unittest.TestCase):
             bot.api = lambda method, files=None, **params: (
                 calls.append((method, params)) or {"message_id": 1}
             )
-            bot.download = lambda file_id: src
+            bot.download = lambda file_id, progress=None: src
             bot.probe = lambda path: {
                 "width": 640,
                 "height": 360,
@@ -307,7 +302,7 @@ class OutputLimitTest(unittest.TestCase):
                 "has_audio": False,
             }
 
-            def fake_compress(source, destination, kind, settings):
+            def fake_compress(source, destination, kind, settings, **kwargs):
                 destination.write_bytes(b"y" * (2 * 1024 * 1024))
                 return bot.probe(destination)
 
@@ -326,6 +321,79 @@ class OutputLimitTest(unittest.TestCase):
                     bot.compress,
                 ) = originals
             self.assertIn("upload limit", result["error"])
+
+
+class AllowTest(unittest.TestCase):
+    def setUp(self):
+        self.original = (bot.ALLOWED, bot.ALLOWED_USERNAMES)
+        self.calls = []
+        self.original_api = bot.api
+        bot.api = lambda method, files=None, **params: (
+            self.calls.append((method, params)) or {"message_id": 1}
+        )
+
+    def tearDown(self):
+        bot.ALLOWED, bot.ALLOWED_USERNAMES = self.original
+        bot.api = self.original_api
+        bot.USERS.clear()
+
+    def test_username_allowlist_is_case_insensitive(self):
+        bot.ALLOWED = set()
+        bot.ALLOWED_USERNAMES = {"samo"}
+        self.assertTrue(bot.is_allowed(7, "Samo"))
+        self.assertTrue(bot.is_allowed(7, "@samo"))
+        self.assertFalse(bot.is_allowed(8, "other"))
+        self.assertFalse(bot.is_allowed(8, ""))
+
+    def test_id_allowlist(self):
+        bot.ALLOWED = {5}
+        bot.ALLOWED_USERNAMES = set()
+        self.assertTrue(bot.is_allowed(5, "someone"))
+        self.assertFalse(bot.is_allowed(6, "someone"))
+
+    def test_empty_lists_are_open(self):
+        bot.ALLOWED = set()
+        bot.ALLOWED_USERNAMES = set()
+        self.assertTrue(bot.is_allowed(42, ""))
+
+    def test_deny_message_shows_identity(self):
+        bot.ALLOWED = {1}
+        bot.ALLOWED_USERNAMES = set()
+        bot.handle(
+            {
+                "chat": {"id": 2},
+                "message_id": 3,
+                "from": {"id": 9, "username": "Nope"},
+                "text": "hi",
+            }
+        )
+        reply = self.calls[0][1]["text"]
+        self.assertIn("private", reply.lower())
+        self.assertIn("Your user ID: 9 (@Nope)", reply)
+
+
+class ProgressTest(unittest.TestCase):
+    def test_hhmmss_parses_out_time(self):
+        self.assertAlmostEqual(bot._hhmmss("00:00:01.500000"), 1.5)
+        self.assertAlmostEqual(bot._hhmmss("00:01:02.000000"), 62.0)
+        self.assertEqual(bot._hhmmss("bogus"), 0.0)
+
+    def test_upload_meter_reports_percent(self):
+        class FakeReporter:
+            def __init__(self):
+                self.texts = []
+
+            def show(self, text, force=False):
+                self.texts.append(text)
+
+        reporter = FakeReporter()
+        meter = bot.UploadMeter(io.BytesIO(b"x" * 1000), 1000, reporter)
+        meter.read(300)
+        meter.read(300)
+        meter.read(400)
+        self.assertIn("📤 Uploading… 30%", reporter.texts)
+        self.assertIn("📤 Uploading… 60%", reporter.texts)
+        self.assertEqual(reporter.texts[-1], "📤 Uploading… 100%")
 
 
 class CallbackTest(unittest.TestCase):

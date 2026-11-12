@@ -42,6 +42,7 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ALLOWED_USER_IDS: ${{ vars.ALLOWED_USER_IDS }}
+          ALLOWED_USERNAMES: ${{ vars.ALLOWED_USERNAMES }}
           BOT_RUN_SECONDS: "19500"
           BOT_RESERVE_SECONDS: "300"
           MAX_INPUT_MB: "20"

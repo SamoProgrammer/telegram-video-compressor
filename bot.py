@@ -32,6 +32,11 @@ ALLOWED = {
     for x in os.environ.get("ALLOWED_USER_IDS", "").replace(" ", "").split(",")
     if x
 }
+ALLOWED_USERNAMES = {
+    part.strip().lstrip("@").lower()
+    for part in os.environ.get("ALLOWED_USERNAMES", "").replace(";", ",").split(",")
+    if part.strip()
+}
 
 TMP = Path(tempfile.mkdtemp(prefix="tg-compress-"))
 SESSION = requests.Session()
@@ -101,6 +106,20 @@ def redact(text: object) -> str:
     return value.replace(TOKEN, "***") if TOKEN else value
 
 
+def is_allowed(user_id: int | None, username: str | None) -> bool:
+    if not ALLOWED and not ALLOWED_USERNAMES:
+        return True
+    if user_id in ALLOWED:
+        return True
+    if username and username.lstrip("@").lower() in ALLOWED_USERNAMES:
+        return True
+    return False
+
+
+def whoami(user_id: int | None, username: str | None) -> str:
+    return f"{user_id}" + (f" (@{username})" if username else "")
+
+
 def api(method: str, files: dict | None = None, **params):
     url = f"{API_BASE}/bot{TOKEN}/{method}"
     clean = {
@@ -146,7 +165,7 @@ def get_updates(offset: int | None):
     return payload["result"]
 
 
-def download(file_id: str) -> Path:
+def download(file_id: str, progress: "ProgressReporter | None" = None) -> Path:
     info = api("getFile", file_id=file_id)
     file_path = info.get("file_path", "")
     # A local Bot API server returns an absolute path and no 20 MB download cap.
@@ -155,6 +174,9 @@ def download(file_id: str) -> Path:
     if not file_path:
         raise BotError("Telegram returned no file path")
     dest = TMP / f"in-{time.time_ns()}.bin"
+    total = int(info.get("file_size") or 0)
+    received = 0
+    first = True
     try:
         with requests.get(
             f"{API_BASE}/file/bot{TOKEN}/{file_path}", stream=True, timeout=600
@@ -163,7 +185,23 @@ def download(file_id: str) -> Path:
                 raise BotError(f"Download failed (HTTP {response.status_code})")
             with dest.open("wb") as handle:
                 for chunk in response.iter_content(chunk_size=256 * 1024):
+                    if not chunk:
+                        continue
                     handle.write(chunk)
+                    received += len(chunk)
+                    if progress:
+                        if total:
+                            percent = min(100, received * 100 // total)
+                            progress.show(
+                                f"⏳ Downloading… {percent}%",
+                                force=first or received >= total,
+                            )
+                        else:
+                            progress.show(
+                                f"⏳ Downloading… {received / 1048576:.1f} MB",
+                                force=first,
+                            )
+                        first = False
     except requests.RequestException:
         raise BotError("Download failed (network error)") from None
     return dest
@@ -256,8 +294,21 @@ def video_filter(kind: str, settings: dict | None = None) -> str:
     )
 
 
+def _hhmmss(value: str) -> float:
+    try:
+        hours, minutes, seconds = value.split(":")
+        return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    except ValueError:
+        return 0.0
+
+
 def compress(
-    src: Path, dst: Path, kind: str, settings: dict | None = None
+    src: Path,
+    dst: Path,
+    kind: str,
+    settings: dict | None = None,
+    duration: float = 0.0,
+    progress: "ProgressReporter | None" = None,
 ) -> dict:
     settings = settings or DEFAULT_SETTINGS
     # shortcut: HDR is flattened to SDR without tonemapping; add zscale if needed.
@@ -275,6 +326,9 @@ def compress(
         "-hide_banner",
         "-loglevel",
         "error",
+        "-nostats",
+        "-progress",
+        "pipe:1",
         "-y",
         "-i",
         str(src),
@@ -310,21 +364,55 @@ def compress(
         "1024",
         str(dst),
     ]
+    err_file = TMP / f"{dst.name}.err"
+    timed_out = False
+    process = None
+    watchdog = None
+
+    def kill_on_timeout() -> None:
+        nonlocal timed_out
+        timed_out = True
+        if process:
+            process.kill()
+
     try:
-        subprocess.run(
-            cmd,
-            check=True,
-            timeout=MAX_DURATION,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
-    except subprocess.TimeoutExpired:
-        raise BotError("Compression timed out") from None
-    except subprocess.CalledProcessError as exc:
-        detail = exc.stderr.decode("utf-8", "replace").strip().splitlines()
-        raise BotError(f"ffmpeg failed: {detail[-1] if detail else 'unknown'}") from None
+        with err_file.open("wb") as errors:
+            process = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=errors, text=True
+            )
+            watchdog = threading.Timer(MAX_DURATION, kill_on_timeout)
+            watchdog.start()
+            for line in process.stdout:
+                if not progress:
+                    continue
+                if line.startswith("out_time=") and duration > 0:
+                    seconds = _hhmmss(line.split("=", 1)[1].strip())
+                    percent = max(1, min(99, int(seconds * 100 / duration)))
+                    progress.show(
+                        f"⚙️ Compressing… {percent}%",
+                        force=int(seconds) < 2,
+                    )
+                elif line.startswith("progress=end"):
+                    progress.show("⚙️ Compressing… 100%", force=True)
+            process.stdout.close()
+            try:
+                process.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                raise BotError("Compression took too long to finish") from None
+            if timed_out:
+                raise BotError("Compression timed out")
+            if process.returncode != 0:
+                detail = err_file.read_text(errors="replace").strip().splitlines()
+                raise BotError(
+                    f"ffmpeg failed: {detail[-1] if detail else 'unknown'}"
+                )
     except OSError as exc:
         raise BotError(f"ffmpeg is not installed: {exc}") from None
+    finally:
+        if watchdog:
+            watchdog.cancel()
+        err_file.unlink(missing_ok=True)
     return probe(dst)
 
 
@@ -380,6 +468,25 @@ def edit_status(chat_id: int, message_id: int, text: str) -> None:
         api("editMessageText", chat_id=chat_id, message_id=message_id, text=text)
     except BotError:
         pass
+
+
+class ProgressReporter:
+    """Edits one status message with per-phase percent, throttled."""
+
+    interval = 2.5
+
+    def __init__(self, chat_id: int, message_id: int):
+        self.chat_id = chat_id
+        self.message_id = message_id
+        self.text = ""
+        self.stamp = 0.0
+
+    def show(self, text: str, force: bool = False) -> None:
+        now = time.time()
+        if text == self.text or (not force and now - self.stamp < self.interval):
+            return
+        self.text, self.stamp = text, now
+        edit_status(self.chat_id, self.message_id, text)
 
 
 def render_text(
@@ -443,6 +550,39 @@ def send_original(
         )
 
 
+class UploadMeter:
+    """Wraps the upload body so requests reports real sent-byte percent."""
+
+    def __init__(self, handle, total: int, progress: "ProgressReporter | None"):
+        self.handle = handle
+        self.total = total
+        self.progress = progress
+        self.sent = 0
+        self.first = True
+
+    def read(self, size=-1):
+        data = self.handle.read(size)
+        if data:
+            self.sent += len(data)
+            if self.progress and self.total:
+                percent = min(100, self.sent * 100 // self.total)
+                self.progress.show(
+                    f"📤 Uploading… {percent}%",
+                    force=self.first or self.sent >= self.total,
+                )
+                self.first = False
+        return data
+
+    def tell(self):
+        return self.handle.tell()
+
+    def seek(self, *args, **kwargs):
+        return self.handle.seek(*args, **kwargs)
+
+    def __len__(self):
+        return self.total
+
+
 def send_result(
     chat_id: int,
     message_id: int,
@@ -452,15 +592,17 @@ def send_result(
     caption: str,
     filename: str = "compressed.mp4",
     keyboard: list | None = None,
+    progress: "ProgressReporter | None" = None,
 ) -> None:
     reply = reply_params(message_id)
     reply_markup = markup(keyboard) if keyboard else None
     duration = max(1, int(info["duration"]))
     with path.open("rb") as handle:
+        body = UploadMeter(handle, path.stat().st_size, progress) if progress else handle
         if kind == "video_note":
             api(
                 "sendVideoNote",
-                files={"video_note": (filename, handle, "video/mp4")},
+                files={"video_note": (filename, body, "video/mp4")},
                 chat_id=chat_id,
                 duration=duration,
                 length=int(info["width"]),
@@ -470,7 +612,7 @@ def send_result(
         elif kind == "document":
             api(
                 "sendDocument",
-                files={"document": (filename, handle, "video/mp4")},
+                files={"document": (filename, body, "video/mp4")},
                 chat_id=chat_id,
                 caption=caption,
                 reply_parameters=reply,
@@ -479,7 +621,7 @@ def send_result(
         else:
             api(
                 "sendVideo",
-                files={"video": (filename, handle, "video/mp4")},
+                files={"video": (filename, body, "video/mp4")},
                 chat_id=chat_id,
                 caption=caption,
                 supports_streaming="true",
@@ -543,7 +685,7 @@ def queue_used(queue: list) -> int:
     return total
 
 
-def cache_item(item: dict, queue: list) -> str | None:
+def cache_item(item: dict, queue: list, progress=None) -> str | None:
     """Download a queued video and evict the oldest cached file if needed."""
     size = item["size"]
     if size > DISK_BUDGET:
@@ -560,7 +702,7 @@ def cache_item(item: dict, queue: list) -> str | None:
         safe_unlink(victim["path"])
         victim["path"] = None
     try:
-        path = download(item["media"]["file_id"])
+        path = download(item["media"]["file_id"], progress)
     except BotError as exc:
         return f"Could not download: {redact(exc)}"
     try:
@@ -595,19 +737,28 @@ def compress_one(
         reply_parameters=reply_params(reply_to),
     )
     status_id = status["message_id"]
+    reporter = ProgressReporter(chat_id, status_id)
+    reporter.text = "⏳ Downloading…"
     src = path
     out = None
     try:
         if src is None or not src.exists():
-            src = download(media["file_id"])
+            src = download(media["file_id"], reporter)
         actual = probe(src)
         if deadline and time.time() + actual["duration"] + 120 > deadline:
             edit_status(chat_id, status_id, "⏳ Not enough time left in this shift.")
             raise Defer
         out_kind, fallback = target_kind(kind, settings, actual["duration"])
-        edit_status(chat_id, status_id, "⚙️ Compressing…")
+        reporter.show("⚙️ Compressing…", force=True)
         out = TMP / f"out-{time.time_ns()}.mp4"
-        info = compress(src, out, out_kind, settings)
+        info = compress(
+            src,
+            out,
+            out_kind,
+            settings,
+            duration=actual["duration"],
+            progress=reporter,
+        )
         in_mb = src.stat().st_size / 1048576
         out_mb = out.stat().st_size / 1048576
         if out_mb >= in_mb * 0.98:
@@ -637,9 +788,17 @@ def compress_one(
                 caption += (
                     "\nRound video is limited to 60 s, so this was sent as a video."
                 )
-            edit_status(chat_id, status_id, "📤 Uploading…")
+            reporter.show("📤 Uploading…", force=True)
             send_result(
-                chat_id, reply_to, out, out_kind, info, caption, filename, keyboard
+                chat_id,
+                reply_to,
+                out,
+                out_kind,
+                info,
+                caption,
+                filename,
+                keyboard,
+                progress=reporter,
             )
             edit_status(chat_id, status_id, caption)
         return {
@@ -916,7 +1075,9 @@ def process_batch(
 
 def handle_callback(cq: dict, deadline: float | None = None) -> None:
     cq_id = cq["id"]
-    user_id = (cq.get("from") or {}).get("id")
+    user = cq.get("from") or {}
+    user_id = user.get("id")
+    username = user.get("username") or ""
     message = cq.get("message") or {}
     chat_id = (message.get("chat") or {}).get("id")
     message_id = message.get("message_id")
@@ -939,8 +1100,8 @@ def handle_callback(cq: dict, deadline: float | None = None) -> None:
             print(f"answerCallbackQuery: {redact(exc)}", flush=True)
 
     try:
-        if ALLOWED and user_id not in ALLOWED:
-            answer("This bot is private.", True)
+        if not is_allowed(user_id, username):
+            answer(f"Private bot. Your ID: {whoami(user_id, username)}", True)
             return
         if chat_id is None or message_id is None:
             answer("This menu is outdated. Send /start.", True)
@@ -1071,13 +1232,19 @@ def handle_callback(cq: dict, deadline: float | None = None) -> None:
 def handle(message: dict, deadline: float | None = None) -> None:
     chat_id = message["chat"]["id"]
     message_id = message["message_id"]
-    user_id = (message.get("from") or {}).get("id")
+    user = message.get("from") or {}
+    user_id = user.get("id")
+    username = user.get("username") or ""
 
-    if ALLOWED and user_id not in ALLOWED:
+    if not is_allowed(user_id, username):
         api(
             "sendMessage",
             chat_id=chat_id,
-            text="This bot is private.",
+            text=(
+                "This bot is private.\n"
+                f"Your user ID: {whoami(user_id, username)}\n"
+                "Ask the owner to add it to ALLOWED_USER_IDS or ALLOWED_USERNAMES."
+            ),
             reply_parameters=reply_params(message_id),
         )
         return
@@ -1216,7 +1383,9 @@ def handle(message: dict, deadline: float | None = None) -> None:
             reply_parameters=reply_params(message_id),
         )
         menu_id = sent["message_id"]
-        error = cache_item(item, state["queue"])
+        reporter = ProgressReporter(chat_id, menu_id)
+        reporter.text = f"⏳ Adding {short(name)}…"
+        error = cache_item(item, state["queue"], reporter)
         if error:
             render_text(
                 chat_id,
@@ -1257,9 +1426,10 @@ def handle(message: dict, deadline: float | None = None) -> None:
 def main() -> None:
     if not TOKEN:
         sys.exit("BOT_TOKEN is not set")
-    if not ALLOWED:
+    if not ALLOWED and not ALLOWED_USERNAMES:
         print(
-            "WARNING: ALLOWED_USER_IDS is empty; anyone can use this bot.",
+            "WARNING: ALLOWED_USER_IDS and ALLOWED_USERNAMES are empty; "
+            "anyone can use this bot.",
             flush=True,
         )
     print(

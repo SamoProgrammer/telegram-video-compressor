@@ -71,10 +71,11 @@ GitHub's Actions terms restrict use to the production, testing, deployment, or p
 2. Create a **public** GitHub repository and push this folder to the default branch (usually `main`).
 3. Repository **Settings → Secrets and variables → Actions → New repository secret**:
    - `BOT_TOKEN` = your bot token.
-4. Optional but strongly recommended: add a repository **variable**:
-   - `ALLOWED_USER_IDS` = your numeric Telegram user ID.
-   - Get it from [@userinfobot](https://t.me/userinfobot), or leave the variable empty for the first run and send `/id` to your bot.
-   - If empty, anyone can use your bot and burn your runner time.
+4. Optional but strongly recommended: add repository **variables**:
+   - `ALLOWED_USER_IDS` = comma-separated numeric Telegram user IDs.
+   - `ALLOWED_USERNAMES` = comma-separated usernames (with or without `@`, case-insensitive).
+   - Get your ID from [@userinfobot](https://t.me/userinfobot), or leave both empty for the first run and send `/id` to the bot.
+   - If both are empty, anyone can use your bot and burn your runner time. Prefer IDs: usernames can be changed or transferred; IDs are permanent. A denied user is told their own ID so you can allow-list them.
 5. Open the **Actions** tab, enable workflows, select `telegram-video-compressor`, and click **Run workflow**.
 6. Open the bot and send `/start`; tap **Single video** or **Multiple videos**.
 
@@ -184,7 +185,7 @@ The Worker answers the user immediately, then triggers one Actions run per video
 
 ## Security notes
 
-- The repository must be public for free Actions minutes. Never put the bot token in code; use the `BOT_TOKEN` secret.
+- The repository must be public for free unlimited Actions minutes (private repos are capped at ~$12/month of compute). A public repo is not a security hole here: the token lives in a secret, and only `ALLOWED_USER_IDS` / `ALLOWED_USERNAMES` users can talk to the bot. IDs are strict; usernames are a convenience.
 - Set `ALLOWED_USER_IDS`; otherwise anyone can use your bot.
 - The runner is ephemeral. Cloud-downloaded videos are deleted when processed or at the end of the shift. A local Bot API server manages its own `--dir`.
 - This is hobby-scale infrastructure. See the terms-of-use reality check above; don't run a public high-volume service on GitHub Actions.
