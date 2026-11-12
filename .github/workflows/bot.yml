@@ -22,7 +22,9 @@ jobs:
       - name: Restore bot state
         uses: actions/cache@v4
         with:
-          path: /tmp/bot-state.json
+          path: |
+            /tmp/bot-state.json
+            /tmp/bot-mtproto.session
           key: bot-state-${{ github.run_id }}
           restore-keys: |
             bot-state-

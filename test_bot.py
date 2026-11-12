@@ -217,36 +217,33 @@ class CardTest(unittest.TestCase):
         deletes = [call for call in self.calls if call[0] == "deleteMessage"]
         self.assertTrue(any(d[1]["message_id"] == first_card for d in deletes))
 
-    def test_settings_navigation_edits_same_card_and_persists(self):
+    def test_settings_navigation_rebottoms_card_and_persists(self):
         bot.handle({"chat": {"id": 1}, "message_id": 2, "from": {"id": 3}, "text": "/start"})
-        calls_now = len(self.calls)
+        first_card = bot.USERS[3]["menu"][1]
         bot.handle_callback(
             {
                 "id": "c1",
                 "from": {"id": 3},
-                "message": {"message_id": 1, "chat": {"id": 1}},
+                "message": {"message_id": first_card, "chat": {"id": 1}},
                 "data": "menu:settings",
             }
         )
-        last_edit = [c for c in self.calls if c[0] == "editMessageText"][-1]
-        self.assertIn("⚙️ Settings", last_edit[1]["text"])
+        state = bot.USERS[3]
+        self.assertNotEqual(state["menu"][1], first_card)
+        sends = [c for c in self.calls if c[0] == "sendMessage"]
+        self.assertIn("Settings", sends[-1][1]["text"])
+        deletes = [c for c in self.calls if c[0] == "deleteMessage"]
+        self.assertTrue(any(d[1]["message_id"] == first_card for d in deletes))
         bot.handle_callback(
             {
                 "id": "c2",
                 "from": {"id": 3},
-                "message": {"message_id": 1, "chat": {"id": 1}},
+                "message": {"message_id": state["menu"][1], "chat": {"id": 1}},
                 "data": "set:res:1080",
             }
         )
         self.assertEqual(bot.USERS[3]["settings"]["resolution"], "1080")
-        saved = bot.STATE_FILE.read_text()
-        self.assertIn('"1080"', saved)
-        # still the same card, never a new message
-        self.assertEqual(len([c for c in self.calls if c[0] == "sendMessage"]), 1)
-        self.assertEqual(
-            bot.USERS[3]["menu"],
-            (1, 1 + calls_now - calls_now + 1 - 1 + 1) if False else bot.USERS[3]["menu"],
-        )
+        self.assertIn('"1080"', bot.STATE_FILE.read_text())
 
     def test_done_with_empty_queue_alerts(self):
         bot.handle({"chat": {"id": 1}, "message_id": 2, "from": {"id": 3}, "text": "/start"})

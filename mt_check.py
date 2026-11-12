@@ -6,6 +6,11 @@ import os
 import sys
 
 from telethon import TelegramClient
+from telethon import errors as telethon_errors
+
+MT_SESSION = os.environ.get(
+    "BOT_MT_SESSION", "/tmp/bot-mtproto.session"
+)
 
 
 async def main() -> int:
@@ -15,18 +20,24 @@ async def main() -> int:
     if not (token and api_id and api_hash):
         print("MTProto check skipped (credentials missing).")
         return 0
-    client = TelegramClient("mt-check", api_id, api_hash)
-    await client.start(bot_token=token)
+    client = TelegramClient(MT_SESSION, api_id, api_hash)
     try:
-        import cryptg
+        await client.start(bot_token=token)
+        me = await client.get_me()
+        print(f"MTProto OK: logged in as @{me.username} (bot id {me.id}); session cached.")
+        try:
+            import cryptg
 
-        print("cryptg present (fast AES).")
-    except ImportError:
-        print("WARNING: cryptg missing; downloads will be slow.")
-    me = await client.get_me()
-    print(f"MTProto OK: logged in as @{me.username} (bot id {me.id})")
-    await client.disconnect()
-    os.remove("mt-check.session") if os.path.exists("mt-check.session") else None
+            print("cryptg present (fast AES).")
+        except ImportError:
+            print("WARNING: cryptg missing; downloads will be slow.")
+    except telethon_errors.FloodWaitError as exc:
+        print(
+            f"MTProto login flood: Telegram wants {exc.seconds}s. The cached "
+            "session avoids re-imports; big files will work after the wait."
+        )
+    finally:
+        await client.disconnect()
     return 0
 
 

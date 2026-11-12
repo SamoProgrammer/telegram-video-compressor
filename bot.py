@@ -38,6 +38,11 @@ MT_UPLOAD_LIMIT = 1900 * 1024 * 1024
 STATE_FILE = Path(
     os.environ.get("BOT_STATE_FILE", str(Path(tempfile.gettempdir()) / "bot-state.json"))
 )
+# One persistent MTProto auth session - login happens once; re-importing
+# per download/shift triggers multi-hour flood waits on shared runner IPs.
+MT_SESSION_FILE = Path(
+    os.environ.get("BOT_MT_SESSION", str(Path(tempfile.gettempdir()) / "bot-mtproto.session"))
+)
 ALLOWED = {
     int(x)
     for x in os.environ.get("ALLOWED_USER_IDS", "").replace(" ", "").split(",")
@@ -375,19 +380,29 @@ def mtproto_download(
     """Parallel download via MTProto with the bot's own token; no 20 MB cap.
 
     Fetches the original message (modern Bot API file_ids cannot be decoded
-    by Telethon) and streams multiple connections in parallel — one
-    MTProto connection saturates far below what Telegram allows.
+    by Telethon) and streams several connections in parallel. One persistent
+    MTProto session (cached across shifts) is reused; parallel workers run
+    on copies of that auth key, so Telegram never sees extra
+    ImportBotAuthorization requests (those cause multi-hour flood waits).
     """
     from telethon import TelegramClient
+    from telethon import errors as telethon_errors
     from telethon.tl.types import InputPeerUser
     from telethon import utils as telethon_utils
 
     chunk = 512 * 1024
 
-    async def start(index: int) -> TelegramClient:
-        client = TelegramClient(
-            str(TMP / f"bot-m{index}.session"), TELEGRAM_API_ID, TELEGRAM_API_HASH
-        )
+    async def start(index: int, seed: bytes | None = None) -> TelegramClient:
+        if index == 0:
+            session = str(MT_SESSION_FILE)
+        else:
+            session_path = TMP / f"bot-m{index}.session"
+            if seed:
+                session_path.write_bytes(seed)
+            else:
+                shutil.copyfile(MT_SESSION_FILE, session_path)
+            session = str(session_path)
+        client = TelegramClient(session, TELEGRAM_API_ID, TELEGRAM_API_HASH)
         await client.start(bot_token=TOKEN)
         return client
 
@@ -406,9 +421,10 @@ def mtproto_download(
                 on_percent(min(100, int(state["done"] * 100 / total)))
 
     async def run() -> Path:
-        main = await start(0)
-        clients = [main]
+        clients = []
         try:
+            main = await start(0)
+            clients.append(main)
             # Bots may address users in their own chats without an access hash.
             peer = InputPeerUser(user_id=chat_id, access_hash=0)
             message = await main.get_messages(peer, ids=message_id)
@@ -417,6 +433,10 @@ def mtproto_download(
             document = message.document
             dc_id, location = telethon_utils.get_input_location(document)
             total = document.size
+
+            seed = None
+            if MT_SESSION_FILE.exists():
+                seed = MT_SESSION_FILE.read_bytes()
 
             regions = mt_regions(total)
             state = {"done": 0}
@@ -435,7 +455,7 @@ def mtproto_download(
                 handles = []
                 try:
                     for index, (offset, length) in enumerate(regions):
-                        client = main if index == 0 else await start(index)
+                        client = main if index == 0 else await start(index, seed)
                         clients.append(client)
                         handle = open(dest, "r+b")
                         handle.seek(offset)
@@ -454,6 +474,11 @@ def mtproto_download(
             if dest.stat().st_size != total:
                 raise BotError("MTProto download came back truncated; try again")
             return dest
+        except telethon_errors.FloodWaitError as exc:
+            raise BotError(
+                f"MTProto cooldown: Telegram asked for a {exc.seconds}s wait "
+                "before more logins. Try small files now, big ones shortly."
+            ) from None
         finally:
             for client in clients:
                 await client.disconnect()
@@ -467,11 +492,13 @@ def mtproto_download(
 
 def settings_line(settings: dict) -> str:
     resolution = (
-        "Original" if settings.get("resolution") == "original" else f"≤{settings.get('resolution', '720')}p"
+        "Original"
+        if settings.get("resolution") == "original"
+        else f"\u2264{settings.get('resolution', '720')}p"
     )
     quality = QUALITIES.get(settings.get("quality", "balanced"), QUALITIES["balanced"])
     output = OUTPUT_LABELS.get(settings.get("output", "auto"), "Auto")
-    return f"{resolution} • {quality[0]} • {output}"
+    return f"{resolution} \u2022 {quality[0]} \u2022 {output}"
 
 
 def target_kind(kind: str, settings: dict, duration: float) -> tuple:
@@ -692,7 +719,6 @@ class UploadMeter:
         self.total = total
         self.on_percent = on_percent
         self.sent = 0
-        self.first = True
 
     def read(self, size=-1):
         data = self.handle.read(size)
@@ -1092,8 +1118,13 @@ def choice_rows(options: list, current: str, prefix: str) -> list:
     return rows
 
 
-def card_refresh(state: dict, force: bool = True) -> None:
-    """Edit THE card in place; send a fresh one when needed; delete the rest."""
+def card_refresh(state: dict) -> None:
+    """Edit THE card in place; send a fresh one when needed; delete the rest.
+
+    Repositioning is driven by events: handles/callbacks clear state["menu"],
+    which forces a fresh send at the bottom of the chat and deletes the old
+    card, so the card is always the latest message after any user action.
+    """
     chat_id = state.get("chat_id")
     if not chat_id:
         return
@@ -1140,7 +1171,7 @@ def make_report(state: dict, item: dict):
             return
         item["status"] = text
         if gate.allow(force=percent is None):
-            card_refresh(state, force=False)
+            card_refresh(state)
 
     return report
 
@@ -1310,10 +1341,9 @@ def process_batch(user_id: int, settings: dict, deadline: float | None = None) -
                 item["delivered"] = True
                 state_in += result["in"]
                 state_out += result["out"]
-            card_refresh(state, force=False)
+            card_refresh(state)
     except Exception as exc:  # noqa: BLE001 - keep the rest queued
         print(f"batch: {redact(exc)}", flush=True)
-    done = state_in and True
     delivered = sum(1 for i in items if i.get("delivered"))
     errors = [i for i in items if (i.get("status") or "").startswith("❌")]
     kept = [i for i in items if not i.get("delivered")]
@@ -1341,7 +1371,7 @@ def process_batch(user_id: int, settings: dict, deadline: float | None = None) -
         pieces.append("Send remaining videos again after the next shift.")
     state["summary"] = " ".join(pieces)
     try:
-        card_refresh(state, force=True)
+        card_refresh(state)
     except Exception as exc:  # noqa: BLE001
         print(f"batch summary: {redact(exc)}", flush=True)
     with STATE_LOCK:
@@ -1379,6 +1409,7 @@ def handle_callback(cq: dict, deadline: float | None = None) -> None:
                 answer(f"Private bot. Your ID: {whoami(user_id, username)}", True)
                 return
         state = get_state(user_id, chat_id)
+        state["menu"] = None  # reposition under the latest activity
         settings = state["settings"]
         if data == "menu:main":
             state["view"] = "main"
@@ -1423,7 +1454,7 @@ def handle_callback(cq: dict, deadline: float | None = None) -> None:
         elif data == "multi:done":
             error = start_batch(state, deadline)
             answer(error or "Starting…", alert=bool(error))
-            card_refresh(state, force=True)
+            card_refresh(state)
             return
         elif data == "multi:clear":
             if state["processing"]:
@@ -1443,7 +1474,7 @@ def handle_callback(cq: dict, deadline: float | None = None) -> None:
         else:
             answer("This menu is outdated. Send /start.", True)
             return
-        card_refresh(state, force=True)
+        card_refresh(state)
     finally:
         answer()
 
@@ -1470,6 +1501,7 @@ def handle(message: dict, deadline: float | None = None) -> None:
             return
 
     state = get_state(user_id, chat_id)
+    state["menu"] = None  # reposition: the card is always the latest message
     text = (message.get("text") or "").strip()
 
     if text.startswith("/start"):
@@ -1477,15 +1509,15 @@ def handle(message: dict, deadline: float | None = None) -> None:
         state["view"] = "main"
         state["note"] = ""
         state["menu"] = None  # fresh card
-        card_refresh(state, force=True)
+        card_refresh(state)
         return
     if text.startswith("/help"):
         state["view"] = "help"
-        card_refresh(state, force=True)
+        card_refresh(state)
         return
     if text.startswith("/settings"):
         state["view"] = "settings"
-        card_refresh(state, force=True)
+        card_refresh(state)
         return
     if text.startswith("/id"):
         api(
@@ -1502,12 +1534,12 @@ def handle(message: dict, deadline: float | None = None) -> None:
         else:
             state["mode"] = "single"
             state["note"] = ""
-        card_refresh(state, force=True)
+        card_refresh(state)
         return
     if text.lower() in ("done", "/done", "✅ done"):
         error = start_batch(state, deadline)
         state["note"] = error or ""
-        card_refresh(state, force=True)
+        card_refresh(state)
         return
 
     found = pick_media(message)
@@ -1569,28 +1601,28 @@ def handle(message: dict, deadline: float | None = None) -> None:
         report = make_report(state, item)
         report("⏳ downloading")
         state["queue"].append(item)
-        card_refresh(state, force=True)
+        card_refresh(state)
         others = [q for q in state["queue"] if q is not item]
         error = cache_item(item, others, lambda pct: report("⏳ downloading", pct))
         if error:
             safe_unlink(item.get("path"))
             state["queue"].remove(item)
             state["note"] = f"❌ {error}"
-            card_refresh(state, force=True)
+            card_refresh(state)
             return
         item["status"] = ""
         state["note"] = ""
-        card_refresh(state, force=True)
+        card_refresh(state)
         return
 
     if deadline and duration and time.time() + duration + 120 > deadline:
         state["note"] = "⏳ Not enough time left in this shift; queued for the next."
-        card_refresh(state, force=True)
+        card_refresh(state)
         raise Defer
 
     state["working"] = [item]
     state["processing"] = True
-    card_refresh(state, force=True)
+    card_refresh(state)
     try:
         result = compress_one(
             chat_id,
@@ -1607,7 +1639,7 @@ def handle(message: dict, deadline: float | None = None) -> None:
         state["working"] = []
         state["processing"] = False
         state["note"] = "⏳ Shift too short — send it again after the next shift starts."
-        card_refresh(state, force=True)
+        card_refresh(state)
         raise
     finally:
         state["processing"] = False
@@ -1616,7 +1648,7 @@ def handle(message: dict, deadline: float | None = None) -> None:
         state["note"] = ""
     else:
         state["note"] = f"{result['error']}"[:180]
-    card_refresh(state, force=True)
+    card_refresh(state)
 
 
 def main() -> None:
