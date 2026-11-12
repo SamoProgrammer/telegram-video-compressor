@@ -11,7 +11,7 @@ import bot
 class ApiTest(unittest.TestCase):
     def test_form_encoding(self):
         captured = {}
-        original = bot.SESSION.post
+        original = bot.requests.post
 
         class Response:
             status_code = 200
@@ -23,7 +23,7 @@ class ApiTest(unittest.TestCase):
             captured["data"] = data
             return Response()
 
-        bot.SESSION.post = fake_post
+        bot.requests.post = fake_post
         try:
             bot.api(
                 "sendMessage",
@@ -33,7 +33,7 @@ class ApiTest(unittest.TestCase):
                 drop_pending_updates=False,
             )
         finally:
-            bot.SESSION.post = original
+            bot.requests.post = original
         self.assertEqual(captured["data"]["drop_pending_updates"], "false")
         self.assertEqual(captured["data"]["reply_parameters"], '{"message_id": 2}')
 

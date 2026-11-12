@@ -39,8 +39,6 @@ ALLOWED_USERNAMES = {
 }
 
 TMP = Path(tempfile.mkdtemp(prefix="tg-compress-"))
-SESSION = requests.Session()
-API_LOCK = threading.Lock()
 STATE_LOCK = threading.Lock()
 JOBS: set[threading.Thread] = set()
 USERS: dict[int, dict] = {}
@@ -128,8 +126,10 @@ def api(method: str, files: dict | None = None, **params):
         if value is not None
     }
     try:
-        with API_LOCK:
-            response = SESSION.post(url, data=clean, files=files, timeout=600)
+        # Per-call connection: upload-percent edits fire from inside the
+        # multipart body reader, so api() must never wait on a lock that the
+        # in-flight upload itself is holding.
+        response = requests.post(url, data=clean, files=files, timeout=600)
     except requests.RequestException:
         raise BotError(f"{method}: network error") from None
     try:
