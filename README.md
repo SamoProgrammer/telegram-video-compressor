@@ -98,7 +98,7 @@ Compressed videos arrive as normal replies to your originals.
 
 ### Shift schedule
 
-Each job works for 5 h 20 min, leaving a buffer under the workflow's 350-minute timeout. Before it ends, the shift queues the next one through the GitHub API using its own `GITHUB_TOKEN` (`actions: write`), so the handoff is usually a few seconds and does not depend on GitHub's scheduler. A `7 */3 * * *` cron is only a fallback for a run that dies too early to re-queue itself.
+Each job works for 5 h 20 min, leaving a buffer under the workflow's 350-minute timeout. Before it ends, the shift queues the next one through the GitHub API using its own `GITHUB_TOKEN` (`actions: write`), so the handoff is one runner startup (a couple of minutes) instead of a multi-hour gap. A `7 */3 * * *` cron is only a fallback for a run that dies too early to re-queue itself.
 
 If a single video arrives too close to the end of a shift, the bot replies "Not enough time left in this shift" and leaves the update unconfirmed. Telegram keeps updates for 24 hours, so the next shift picks it up.
 
