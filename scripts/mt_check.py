@@ -2,15 +2,14 @@
 """One-shot MTProto login check with the bot token (proves api_id/hash)."""
 
 import asyncio
+import importlib.util
 import os
 import sys
 
 from telethon import TelegramClient
 from telethon import errors as telethon_errors
 
-MT_SESSION = os.environ.get(
-    "BOT_MT_SESSION", "/tmp/bot-mtproto.session"
-)
+MT_SESSION = os.environ.get("BOT_MT_SESSION", "/tmp/bot-mtproto.session")
 
 
 async def main() -> int:
@@ -24,12 +23,12 @@ async def main() -> int:
     try:
         await client.start(bot_token=token)
         me = await client.get_me()
-        print(f"MTProto OK: logged in as @{me.username} (bot id {me.id}); session cached.")
-        try:
-            import cryptg
-
+        print(
+            f"MTProto OK: logged in as @{me.username} (bot id {me.id}); session cached."
+        )
+        if importlib.util.find_spec("cryptg"):
             print("cryptg present (fast AES).")
-        except ImportError:
+        else:
             print("WARNING: cryptg missing; downloads will be slow.")
     except telethon_errors.FloodWaitError as exc:
         print(

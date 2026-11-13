@@ -59,7 +59,7 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
           TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
-        run: python mt_check.py
+        run: python scripts/mt_check.py
 
       - name: Run bot shift
         run: python bot.py
