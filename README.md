@@ -98,7 +98,7 @@ Compressed videos arrive as normal replies to your originals.
 
 ### Shift schedule
 
-The workflow runs every 5 hours (`7 */5 * * *`, minute 7 to avoid the top-of-the-hour scheduling rush). Each job works for 5 h 20 min, leaving a buffer under the workflow's 350-minute timeout. The next run is queued before the current one ends, so the handoff is usually a few seconds.
+Each job works for 5 h 20 min, leaving a buffer under the workflow's 350-minute timeout. Before it ends, the shift queues the next one through the GitHub API using its own `GITHUB_TOKEN` (`actions: write`), so the handoff is usually a few seconds and does not depend on GitHub's scheduler. A `7 */3 * * *` cron is only a fallback for a run that dies too early to re-queue itself.
 
 If a single video arrives too close to the end of a shift, the bot replies "Not enough time left in this shift" and leaves the update unconfirmed. Telegram keeps updates for 24 hours, so the next shift picks it up.
 
@@ -241,7 +241,7 @@ The Worker answers the user immediately, then triggers one Actions run per video
 - **`Conflict: terminated by other getUpdates request`:** two runs overlapped. The concurrency group prevents this; wait for the old run to finish.
 - **"file is too big":** the video is over 20 MB. Use a round video message, a shorter clip, or local Bot API mode.
 - **Buttons look plain:** colored buttons need a current Telegram client. Older clients ignore `style`; the buttons still work.
-- **My batch disappeared after a shift:** batch queues are in runner memory. Send the videos again after the next shift starts.
+- **My batch disappeared after a shift:** settings and queues persist through the state cache, but Telegram file IDs expire after 24 hours. Items that expire fail per-row; send those videos again.
 - **Round video output arrived as a regular video:** clips longer than 60 seconds cannot be video notes, so the bot falls back.
 - **Scheduled workflow stopped after 60 days:** GitHub disables scheduled workflows in inactive public repositories. Re-enable it in the Actions tab and push a commit; GitHub counts commits, not scheduled runs, as activity.
 - **Private repository:** included compute is $12/month (~33 Linux hours); 24/7 shifts will hit the limit. Make the repository public.

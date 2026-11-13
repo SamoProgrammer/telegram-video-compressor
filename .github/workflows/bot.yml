@@ -1,10 +1,11 @@
 name: telegram-video-compressor
 
 on:
+  # GitHub's scheduler is best-effort and can silently skip windows. Each
+  # shift queues the next one itself; the cron is only a fallback for a run
+  # that dies before it can re-queue.
   schedule:
-    - cron: "7 */5 * * *"
-    # temporary probe: remove once schedule delivery is confirmed
-    - cron: "*/10 * * * *"
+    - cron: "7 */3 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -13,12 +14,16 @@ concurrency:
 
 permissions:
   contents: read
+  actions: write
 
 jobs:
   compress:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
+      - name: Mark shift start
+        run: date +%s > /tmp/shift-start
+
       - uses: actions/checkout@v4
 
       - name: Restore bot state
@@ -71,3 +76,19 @@ jobs:
           MAX_DURATION: "3600"
           DISK_BUDGET_MB: "2048"
           BOT_STATE_FILE: "/tmp/bot-state.json"
+
+      - name: Queue next shift
+        # Runs on success and failure, but not on a manual cancel. Skipped
+        # for very short runs so a broken setup cannot re-dispatch in a loop.
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          start=$(cat /tmp/shift-start 2>/dev/null || echo 0)
+          elapsed=$(( $(date +%s) - start ))
+          if [ "$elapsed" -lt 1800 ]; then
+            echo "Shift lasted ${elapsed}s; not re-queuing (cron will retry)."
+            exit 0
+          fi
+          gh api -X POST "repos/${{ github.repository }}/actions/workflows/bot.yml/dispatches" -f ref=main
+          echo "Next shift queued."
