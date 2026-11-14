@@ -46,12 +46,20 @@ class SecureStateTest(unittest.TestCase):
         self.assertEqual((self.private / "bot-state.json").read_bytes(), state)
         self.assertEqual((self.private / "bot-mtproto.session").read_bytes(), session)
 
+    def test_restore_and_save_prepare_fixed_directories(self):
+        with mock.patch.dict(os.environ, {"BOT_STATE_ENCRYPTION_KEY": ""}):
+            secure_state.restore()
+            secure_state.save()
+
+        self.assertTrue(self.private.is_dir())
+        self.assertTrue(self.cache.is_dir())
+
     def test_missing_files_are_okay(self):
         with mock.patch.dict(os.environ, {"BOT_STATE_ENCRYPTION_KEY": ""}):
             secure_state.restore()
             secure_state.save()
 
-        self.private.mkdir()
+        self.private.mkdir(parents=True, exist_ok=True)
         state = b"state only"
         (self.private / "bot-state.json").write_bytes(state)
         secure_state.save()

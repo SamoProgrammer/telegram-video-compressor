@@ -44,8 +44,14 @@ def _atomic_write(path, data):
         raise
 
 
+def _prepare_dirs() -> None:
+    for directory in (PRIVATE_DIR, CACHE_DIR):
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+
 def restore():
     """Decrypt every available cache file before replacing any plaintext."""
+    _prepare_dirs()
     restored = []
     fernet = None
     for name in FILENAMES:
@@ -69,6 +75,7 @@ def restore():
 
 def save():
     """Encrypt every existing plaintext file before replacing any cache file."""
+    _prepare_dirs()
     encrypted_files = []
     fernet = None
     for name in FILENAMES:
