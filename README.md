@@ -74,6 +74,54 @@ Round video notes are cropped square and capped at 640 px. Clips longer than
 pipeline (video $N$ encodes while $N+1$ downloads and $N-1$ uploads). The batch
 worker accounts for actual input and output bytes against `DISK_BUDGET_MB`,
 preserves 1 GiB of free disk space, and joins transfer workers before cleanup.
+Probes are reused where possible instead of repeating input inspection.
+
+## Throughput and performance
+
+The scheduler runs one encoder at a time (FFmpeg keeps its automatic threading),
+two downloads, two uploads, and four bounded conversation workers. Consecutive
+single-mode videos queue durably in FIFO order; unsubmitted batch queues still
+remain idle. Connections and CPU are shared across conversations without
+running multiple competing encoders on the standard 4-vCPU public runner.
+
+Cloud Bot API downloads remain HTTP for inputs below 8 MiB. Larger cloud inputs
+prefer MTProto, with up to four shared connections. MTProto uploads of at least
+32 MiB use concurrent 512 KiB parts and the same bytes are sent as one assembled
+file; smaller uploads keep Telethon's normal sender. Clients persist across
+operations on a dedicated event loop and close only after workers join. The
+shared connection lease bounds concurrent jobs and avoids connection floods.
+Single-mode jobs remain end-to-end FIFO; use batch mode for overlapped
+multi-file transfer and encoding.
+
+Actions logs include JSON `pipeline_stage` events for download, encoding, each
+FFmpeg pass, upload, and `file_id` reuse. Each attempt gets a random correlation
+`job` (not a user ID), with route, codec/preset, bytes, active milliseconds,
+MiB/s, and `child_process_cpu_seconds`, a process-wide child-CPU delta that can
+include unrelated concurrent probes. Failed stages report zero bytes and rate;
+only successful stages should be used for throughput comparisons. Use `encode`
+and the transfer events for totals; `ffmpeg` is the per-pass breakdown inside
+`encode`.
+
+`scripts/benchmark.py` measures codec speed and quality without changing
+production defaults. It includes repeated short synthetic clips (motion,
+seeded noise, and flat bars), VMAF/SSIM comparison, median timings, and file
+sizes. A faster candidate is accepted only when its median VMAF is at least 95
+and no more than one point below its codec baseline, and its output is no
+larger than baseline. This is an engineering gate, not a universal perceptual
+quality guarantee; review representative real clips before changing presets.
+
+```bash
+# Run locally or dispatch the codec-performance workflow on a GitHub runner.
+python -m scripts.benchmark --repetitions 3
+
+# Use representative input clips instead of synthetic patterns.
+python -m scripts.benchmark --input path/to/clip.mp4 --repetitions 3
+```
+
+The benchmark needs FFmpeg with `libvmaf`. Results go to stdout and optionally
+to JSON with `--report path/to/results.json`. Current local evidence and the
+policy for accepting changes are in `PERF.md`. No hardware-runner change is
+part of the optimized deployment.
 
 ## Limits
 
@@ -150,12 +198,13 @@ separately.
 | `config.py` | Environment parsing, limits, allow-list, paths |
 | `errors.py` | `BotError` (user-facing) and `Defer` (shift too short) |
 | `telegram_api.py` | Bot API HTTP client, streaming download, upload metering |
-| `mtproto.py` | Telethon download/upload above the cloud API caps |
+| `mtproto.py` | Reusable MTProto sessions, bounded parallel download/upload |
 | `media.py` | ffprobe, presets, filters, ffmpeg encode |
-| `transfer.py` | Chooses Bot API or MTProto for each download/upload |
+| `metrics.py` | Correlated stage timings, transfer rates, and CPU timing |
+| `transfer.py` | Bounded transfer pools and Bot API/MTProto routing |
 | `queue.py` | Eager batch downloads and disk-budget eviction |
 | `files.py` | `safe_unlink`: deletes only inside the work directory |
-| `state.py` | Per-conversation state, receipts, pending updates, and JSON persistence |
+| `state.py` | Per-conversation state, receipts, pending updates, probe metadata, and JSON persistence |
 | `ui.py` | Card text, keyboards, throttled repaints |
 | `pipeline.py` | One video: download → probe → compress → send |
 | `batch.py` | Batch worker, disk accounting, cancel/defer, summary |

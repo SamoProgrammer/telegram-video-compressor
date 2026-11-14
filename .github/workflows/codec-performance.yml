@@ -1,0 +1,48 @@
+name: codec-performance
+
+on:
+  workflow_dispatch:
+    inputs:
+      repetitions:
+        description: "Runs per profile and fixture"
+        default: "3"
+        required: false
+        type: string
+      duration:
+        description: "Seconds per synthetic fixture"
+        default: "3"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Ensure FFmpeg and libvmaf are available
+        run: |
+          if ! command -v ffmpeg >/dev/null || ! ffmpeg -hide_banner -filters 2>/dev/null | grep -q libvmaf; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+          ffmpeg -hide_banner -filters 2>/dev/null | grep libvmaf
+      - name: Measure codec speed and quality
+        run: |
+          python -m scripts.benchmark \
+            --repetitions "${{ inputs.repetitions || '3' }}" \
+            --duration "${{ inputs.duration || '3' }}" \
+            --report "$RUNNER_TEMP/codec-performance.json" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codec-performance-${{ github.run_id }}
+          path: ${{ runner.temp }}/codec-performance.json
+          if-no-files-found: error
+          retention-days: 30
