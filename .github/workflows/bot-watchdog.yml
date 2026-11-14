@@ -1,0 +1,28 @@
+name: telegram-video-compressor-watchdog
+
+on:
+  schedule:
+    - cron: "7 */3 * * *"
+
+permissions:
+  actions: write
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Dispatch bot only when no run is active
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for status in in_progress queued waiting requested pending; do
+            count=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/bot.yml/runs?status=${status}&per_page=1" --jq '.total_count')
+            if [ "$count" -gt 0 ]; then
+              echo "A bot run is ${status}; not dispatching."
+              exit 0
+            fi
+          done
+          default_branch=$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.default_branch')
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/workflows/bot.yml/dispatches" -f ref="$default_branch"
+          echo "No active bot run found; dispatched a new shift."

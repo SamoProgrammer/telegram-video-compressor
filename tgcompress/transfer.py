@@ -6,12 +6,12 @@ import os
 import time
 from pathlib import Path
 
-from .config import Config
-from .errors import BotError
+from .config import CLOUD_UPLOAD_LIMIT_BYTES, Config
+from .errors import BotError, UploadTooLarge
 from .mtproto import MTProtoClient
 from .telegram_api import BotApi, UploadMeter, reply_parameters
 
-BOT_API_UPLOAD_CAP = 50 * 1024 * 1024
+BOT_API_UPLOAD_CAP = CLOUD_UPLOAD_LIMIT_BYTES
 
 
 class Transfer:
@@ -87,7 +87,25 @@ class Transfer:
         filename: str = "compressed.mp4",
         on_percent=None,
     ) -> None:
-        if path.stat().st_size > BOT_API_UPLOAD_CAP and self.config.mt_ready:
+        size = path.stat().st_size
+        limit = self.config.bot_api_upload_limit_bytes
+        api_mode = "cloud" if self.config.using_cloud_api else "local"
+        use_mtproto = size > limit and self.config.mt_ready
+        route = "mtproto" if use_mtproto else "bot_api"
+        if size > limit and self.config.using_cloud_api and not self.config.mt_ready:
+            route = "error"
+        print(
+            f"upload decision: size_bytes={size} route={route} "
+            f"api_mode={api_mode} mt_ready={self.config.mt_ready} "
+            f"limit_bytes={limit}",
+            flush=True,
+        )
+
+        def send_mtproto(reason: str) -> None:
+            print(
+                f"upload fallback: size_bytes={size} route=mtproto reason={reason}",
+                flush=True,
+            )
             self.mtproto.upload(
                 chat_id,
                 message_id,
@@ -98,41 +116,56 @@ class Transfer:
                 info,
                 on_percent,
             )
+
+        if use_mtproto:
+            send_mtproto("size_preflight")
             return
+        if size > limit and self.config.using_cloud_api and not self.config.mt_ready:
+            raise UploadTooLarge(
+                f"Compressed output is {size / 1048576:.1f} MiB; the safe cloud "
+                f"limit is {limit} bytes. Enable MTProto or a local Bot API server, "
+                "or choose a smaller target size/resolution."
+            )
+
         reply = reply_parameters(message_id)
         duration = max(1, int(info["duration"]))
-        with path.open("rb") as handle:
-            body = (
-                UploadMeter(handle, path.stat().st_size, on_percent)
-                if on_percent
-                else handle
-            )
-            if kind == "video_note":
-                self.api.call(
-                    "sendVideoNote",
-                    files={"video_note": (filename, body, "video/mp4")},
-                    chat_id=chat_id,
-                    duration=duration,
-                    length=int(info["width"]),
-                    reply_parameters=reply,
-                )
-            elif kind == "document":
-                self.api.call(
-                    "sendDocument",
-                    files={"document": (filename, body, "video/mp4")},
-                    chat_id=chat_id,
-                    caption=caption,
-                    reply_parameters=reply,
-                )
-            else:
-                self.api.call(
-                    "sendVideo",
-                    files={"video": (filename, body, "video/mp4")},
-                    chat_id=chat_id,
-                    caption=caption,
-                    supports_streaming="true",
-                    width=int(info["width"]),
-                    height=int(info["height"]),
-                    duration=duration,
-                    reply_parameters=reply,
-                )
+        try:
+            with path.open("rb") as handle:
+                body = UploadMeter(handle, size, on_percent) if on_percent else handle
+                if kind == "video_note":
+                    self.api.call(
+                        "sendVideoNote",
+                        files={"video_note": (filename, body, "video/mp4")},
+                        chat_id=chat_id,
+                        duration=duration,
+                        length=int(info["width"]),
+                        reply_parameters=reply,
+                    )
+                elif kind == "document":
+                    self.api.call(
+                        "sendDocument",
+                        files={"document": (filename, body, "video/mp4")},
+                        chat_id=chat_id,
+                        caption=caption,
+                        reply_parameters=reply,
+                    )
+                else:
+                    self.api.call(
+                        "sendVideo",
+                        files={"video": (filename, body, "video/mp4")},
+                        chat_id=chat_id,
+                        caption=caption,
+                        supports_streaming="true",
+                        width=int(info["width"]),
+                        height=int(info["height"]),
+                        duration=duration,
+                        reply_parameters=reply,
+                    )
+        except UploadTooLarge:
+            if not self.config.mt_ready:
+                raise UploadTooLarge(
+                    f"Telegram rejected the {size}-byte upload as too large. "
+                    "Enable MTProto or a local Bot API server, or choose a "
+                    "smaller target size/resolution."
+                ) from None
+            send_mtproto("telegram_rejected")

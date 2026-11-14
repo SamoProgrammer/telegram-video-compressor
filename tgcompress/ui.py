@@ -3,84 +3,26 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 
 from .config import Config
 from .errors import BotError
 from .media import settings_line
-
-# Compression settings options
-CODECS = [
-    ("h264", "H.264"),
-    ("hevc", "H.265 (HEVC)"),
-    ("av1", "AV1 (SVT)"),
-    ("vp9", "VP9"),
-]
-
-MODES = [
-    ("crf", "Quality (CRF)"),
-    ("size", "Target File Size"),
-]
-
-CRF_OPTIONS = [
-    ("18", "18"),
-    ("22", "22"),
-    ("26", "26"),
-    ("30", "30"),
-    ("34", "34"),
-]
-
-TARGET_SIZES = [
-    ("10mb", "10MB"),
-    ("20mb", "20MB"),
-    ("50mb", "50MB"),
-    ("50pct", "50%"),
-    ("25pct", "25%"),
-]
-
-RES_OPTIONS = [
-    ("original", "Original"),
-    ("2160", "2160p"),
-    ("1440", "1440p"),
-    ("1080", "1080p"),
-    ("720", "720p"),
-    ("480", "480p"),
-    ("360", "360p"),
-    ("240", "240p"),
-]
-
-FPS_OPTIONS = [
-    ("orig", "Original"),
-    ("30", "30 fps"),
-    ("24", "24 fps"),
-]
-
-AUDIO_OPTIONS = [
-    ("auto", "Auto"),
-    ("copy", "Pass-through"),
-    ("aac", "AAC 96k"),
-    ("opus", "Opus 64k"),
-    ("mono", "Mono"),
-    ("mute", "Mute"),
-]
-
-OUTPUT_OPTIONS = [
-    ("auto", "Auto"),
-    ("video", "Video"),
-    ("document", "Document"),
-    ("note", "Round Note"),
-]
-
-TUNE_OPTIONS = [
-    ("none", "Tune: None"),
-    ("film", "Tune: Film"),
-    ("animation", "Tune: Animation"),
-]
-
-TONEMAP_OPTIONS = [
-    ("auto", "HDR Tonemap: Auto"),
-    ("off", "HDR Tonemap: Off"),
-]
+from .settings import (
+    AUDIO_OPTIONS,
+    CODECS,
+    CRF_OPTIONS,
+    FPS_OPTIONS,
+    MODES,
+    OUTPUT_OPTIONS,
+    RES_OPTIONS,
+    TARGET_SIZES,
+    TONEMAP_OPTIONS,
+    TUNE_OPTIONS,
+    canonical_audio,
+    canonical_target_size,
+)
 
 
 def persistent_reply_keyboard() -> str:
@@ -173,7 +115,7 @@ def settings_block(state: dict) -> str:
     codec = dict(CODECS).get(s.get("codec", "h264"), "H.264")
     mode = "Quality (CRF)" if s.get("mode", "crf") == "crf" else "Target File Size"
     if s.get("mode", "crf") == "size":
-        target = s.get("target_size", "20mb")
+        target = canonical_target_size(str(s.get("target_size", "20mb")))
         q_text = f"Target Size: {dict(TARGET_SIZES).get(target, target.upper())}"
     else:
         q_text = f"CRF: {s.get('crf', 26)}"
@@ -183,7 +125,9 @@ def settings_block(state: dict) -> str:
         else f"≤{s.get('resolution', '720')}p"
     )
     fps = "Original" if s.get("fps", "orig") == "orig" else f"{s.get('fps')} fps"
-    audio = dict(AUDIO_OPTIONS).get(s.get("audio", "auto"), "Auto")
+    audio = dict(AUDIO_OPTIONS).get(
+        canonical_audio(str(s.get("audio", "auto"))), "Auto"
+    )
     output = dict(OUTPUT_OPTIONS).get(s.get("output", "auto"), "Auto")
     tune = s.get("tune", "none").capitalize()
     tonemap = s.get("tonemap", "auto").capitalize()
@@ -265,15 +209,18 @@ def _views_text(state: dict, config: Config) -> str:
             "Select message format:\n"
             "• Auto: Match incoming message kind\n"
             "• Video: Regular streamable video\n"
-            "• Document: Uncompressed file attachment\n"
+            "• Document: Attachment (avoids Telegram video re-encoding)\n"
             "• Round Note: Circular video message (capped at 60s)"
         )
     if view == "tune":
         return (
             "⚙️ Settings › Advanced Tuning\n\n"
             "Content tuning and HDR color handling:\n"
-            "• Film / Animation: Optimizes encoder rate distortion\n"
-            "• HDR Tonemap: Convert HDR (BT.2020) color spaces to standard SDR"
+            "• Film: H.264 encoder tuning\n"
+            "• Animation: H.264/H.265 encoder tuning\n"
+            "  Other codecs and unsupported combinations safely omit tuning\n"
+            "• HDR Tonemap: Convert HDR (BT.2020) color spaces to standard SDR;\n"
+            "  Off leaves HDR untouched"
         )
     if view == "clear_confirm":
         count = len(state.get("queue", []))
@@ -287,16 +234,27 @@ def _views_text(state: dict, config: Config) -> str:
     return settings_block(state)
 
 
+MAX_VISIBLE_ROWS = 20
+MAX_CARD_TEXT_CHARS = 4000
+
+
 def _rows(items: list) -> list[str]:
     lines = []
-    for number, item in enumerate(items, 1):
+    for number, item in enumerate(items[:MAX_VISIBLE_ROWS], 1):
         size = item.get("size", 0) / 1048576
-        status = item.get("status") or "queued"
+        status = short(item.get("status") or "queued", 80)
         lines.append(
             f"{number}. {short(item.get('name', 'video'), 24)} — "
             f"{size:.1f} MB · {status}"
         )
+    remaining = len(items) - MAX_VISIBLE_ROWS
+    if remaining > 0:
+        lines.append(f"… {remaining} more item(s)…")
     return lines
+
+
+def _bounded_card(lines: list[str]) -> str:
+    return "\n".join(lines)[:MAX_CARD_TEXT_CHARS]
 
 
 def card_text(state: dict, config: Config) -> str:
@@ -316,7 +274,7 @@ def card_text(state: dict, config: Config) -> str:
         lines.extend(_rows(state["working"]) or ["starting…"])
         if state["cancel"]:
             lines.append("Stopping after the current video…")
-        return "\n".join(lines)
+        return _bounded_card(lines)
     if view == "main":
         if state["mode"] == "batch":
             if state["queue"]:
@@ -329,7 +287,7 @@ def card_text(state: dict, config: Config) -> str:
             lines.append("Send one video whenever ready — or switch to 📚 batch mode.")
     else:
         lines.append(_views_text(state, config))
-    return "\n".join(lines)
+    return _bounded_card(lines)
 
 
 def settings_main_kb(state: dict) -> list[list[dict]]:
@@ -338,7 +296,7 @@ def settings_main_kb(state: dict) -> list[list[dict]]:
     mode_val = s.get("mode", "crf")
     mode_label = "CRF" if mode_val == "crf" else "Target Size"
     if mode_val == "size":
-        target = s.get("target_size", "20mb")
+        target = canonical_target_size(str(s.get("target_size", "20mb")))
         q_label = dict(TARGET_SIZES).get(target, target.upper())
     else:
         crf = s.get("crf", 26)
@@ -347,7 +305,9 @@ def settings_main_kb(state: dict) -> list[list[dict]]:
     res_label = "Original" if res == "original" else f"{res}p"
     fps = s.get("fps", "orig")
     fps_label = "Original" if fps == "orig" else f"{fps}fps"
-    audio_label = dict(AUDIO_OPTIONS).get(s.get("audio", "auto"), "Auto")
+    audio_label = dict(AUDIO_OPTIONS).get(
+        canonical_audio(str(s.get("audio", "auto"))), "Auto"
+    )
     out_label = dict(OUTPUT_OPTIONS).get(s.get("output", "auto"), "Auto")
     tune_val = s.get("tune", "none")
     tune_label = "None" if tune_val == "none" else tune_val.capitalize()
@@ -386,7 +346,9 @@ def card_kb(state: dict) -> list:
     if view == "quality":
         if s.get("mode") == "size":
             return make_2col_keyboard(
-                TARGET_SIZES, s.get("target_size", "20mb"), "set:size:"
+                TARGET_SIZES,
+                canonical_target_size(str(s.get("target_size", "20mb"))),
+                "set:size:",
             )
         return make_2col_keyboard(CRF_OPTIONS, str(s.get("crf", 26)), "set:crf:")
     if view == "res":
@@ -394,7 +356,11 @@ def card_kb(state: dict) -> list:
     if view == "fps":
         return make_2col_keyboard(FPS_OPTIONS, s.get("fps", "orig"), "set:fps:")
     if view == "audio":
-        return make_2col_keyboard(AUDIO_OPTIONS, s.get("audio", "auto"), "set:audio:")
+        return make_2col_keyboard(
+            AUDIO_OPTIONS,
+            canonical_audio(str(s.get("audio", "auto"))),
+            "set:audio:",
+        )
     if view == "output":
         return make_2col_keyboard(OUTPUT_OPTIONS, s.get("output", "auto"), "set:out:")
     if view == "tune":
@@ -477,8 +443,13 @@ class CardRenderer:
         self.api = api
         self.store = store
         self.config = config
+        self._lock = threading.Lock()
 
     def refresh(self, state: dict) -> None:
+        with self._lock:
+            self._refresh(state)
+
+    def _refresh(self, state: dict) -> None:
         """Edit THE card in place; send a fresh one when needed; delete the rest.
 
         Repositioning is driven by events: handlers clear state["menu"] on incoming

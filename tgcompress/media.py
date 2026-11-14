@@ -12,17 +12,18 @@ from pathlib import Path
 from typing import TypedDict
 
 from .errors import BotError
+from .settings import (
+    AUDIO_OPTIONS,
+    CODECS,
+    DEFAULT_SETTINGS,
+    OUTPUT_OPTIONS,
+    QUALITIES,
+    RESOLUTIONS,
+    TARGET_SIZES,
+    canonical_audio,
+    canonical_target_size,
+)
 
-RESOLUTIONS = [
-    ("original", "Original"),
-    ("2160", "2160p"),
-    ("1440", "1440p"),
-    ("1080", "1080p"),
-    ("720", "720p"),
-    ("480", "480p"),
-    ("360", "360p"),
-    ("240", "240p"),
-]
 RESOLUTION_LABELS = dict(RESOLUTIONS)
 RESOLUTION_CAPS = {
     "2160": 3840,
@@ -46,58 +47,11 @@ VBV_BOUNDS = {
     "original": ("8M", "16M"),
 }
 
-# label, x264 preset, CRF — presets trade a little size for real speed.
-QUALITIES = {
-    "lossless": ("Near Lossless", "faster", 18),
-    "high": ("High", "faster", 22),
-    "balanced": ("Balanced", "veryfast", 26),
-    "small": ("Small", "veryfast", 30),
-    "extreme": ("Extreme", "veryfast", 34),
-}
-
-CODECS = [
-    ("h264", "H.264"),
-    ("hevc", "H.265 / HEVC"),
-    ("av1", "AV1"),
-    ("vp9", "VP9"),
-]
 CODEC_LABELS = dict(CODECS)
-
-AUDIO_OPTIONS = [
-    ("auto", "Auto"),
-    ("copy", "Copy"),
-    ("aac_96k", "AAC 96k"),
-    ("opus_64k", "Opus 64k"),
-    ("mono", "Mono"),
-    ("mute", "Mute"),
-]
 AUDIO_LABELS = dict(AUDIO_OPTIONS)
-
-TARGET_SIZES = [
-    ("10mb", "10 MB"),
-    ("20mb", "20 MB"),
-    ("50mb", "50 MB"),
-    ("50%", "50%"),
-    ("25%", "25%"),
-]
 TARGET_SIZE_LABELS = dict(TARGET_SIZES)
-
-OUTPUTS = [
-    ("auto", "Auto"),
-    ("video", "Video"),
-    ("document", "Document"),
-    ("note", "Round video"),
-]
-OUTPUT_LABELS = dict(OUTPUTS)
-
-DEFAULT_SETTINGS = {
-    "resolution": "720",
-    "quality": "balanced",
-    "output": "auto",
-    "codec": "h264",
-    "audio": "auto",
-    "fps": "orig",
-}
+OUTPUTS = OUTPUT_OPTIONS
+OUTPUT_LABELS = dict(OUTPUT_OPTIONS)
 NOTE_MAX_SECONDS = 60
 
 VIDEO_SUFFIXES = {
@@ -122,6 +76,7 @@ class MediaInfo(TypedDict, total=False):
     duration: float
     has_audio: bool
     codec_name: str
+    video_stream_index: int
     pix_fmt: str
     color_space: str
     color_transfer: str
@@ -133,6 +88,9 @@ class MediaInfo(TypedDict, total=False):
     audio_bitrate: int
 
 
+# Standalone direct media.compress(job_id=...) cancellation registry. Pipeline
+# cancellation uses its per-conversation registry; this remains for callers that
+# invoke the media layer directly.
 # Active process cancellation registry
 ACTIVE_PROCESSES: dict[str, subprocess.Popen] = {}
 CANCELLED_JOBS: set[str] = set()
@@ -274,15 +232,16 @@ def probe(path: Path) -> MediaInfo:
         raise BotError("Could not read video metadata") from None
 
     streams = data.get("streams", [])
-    video = next(
+    video_index, video = next(
         (
-            s
-            for s in streams
-            if s.get("codec_type") == "video" and not is_cover_art_stream(s)
+            (index, stream)
+            for index, stream in enumerate(streams)
+            if stream.get("codec_type") == "video"
+            and not is_cover_art_stream(stream)
         ),
-        None,
+        (None, None),
     )
-    if not video:
+    if video is None:
         raise BotError("No video stream found")
 
     audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
@@ -334,6 +293,7 @@ def probe(path: Path) -> MediaInfo:
         "height": height,
         "duration": duration,
         "has_audio": audio is not None,
+        "video_stream_index": video_index,
         "codec_name": str(video.get("codec_name", "")).lower(),
         "pix_fmt": str(video.get("pix_fmt", "")).lower(),
         "color_space": str(video.get("color_space", "")).lower(),
@@ -370,12 +330,17 @@ def settings_line(settings: dict) -> str:
         else f"\u2264{settings.get('resolution', '720')}p"
     )
     quality_key = settings.get("quality", "balanced")
-    if quality_key in QUALITIES:
+    legacy_target = canonical_target_size(str(quality_key))
+    mode = settings.get("mode")
+    if mode == "size" or (mode != "crf" and settings.get("target_size")):
+        target = canonical_target_size(str(settings.get("target_size", "20mb")))
+        quality_str = f"Target {TARGET_SIZE_LABELS.get(target, target.upper())}"
+    elif "crf" in settings:
+        quality_str = f"CRF {settings['crf']}"
+    elif quality_key in QUALITIES:
         quality_str = QUALITIES[quality_key][0]
-    elif str(quality_key).lower() in TARGET_SIZE_LABELS:
-        quality_str = TARGET_SIZE_LABELS[str(quality_key).lower()]
-    elif "target_size" in settings:
-        quality_str = f"Target {settings['target_size']}"
+    elif legacy_target in TARGET_SIZE_LABELS:
+        quality_str = TARGET_SIZE_LABELS[legacy_target]
     else:
         quality_str = str(quality_key).capitalize()
     output = OUTPUT_LABELS.get(settings.get("output", "auto"), "Auto")
@@ -407,7 +372,7 @@ def build_video_filter(
     filters: list[str] = []
 
     # 1. HDR tone-mapping
-    if is_hdr(info):
+    if is_hdr(info) and str(settings.get("tonemap", "auto")).lower() != "off":
         filters.append("tonemap=mobius,format=yuv420p")
 
     # 2. Crop / Scale
@@ -453,7 +418,7 @@ def build_audio_args(
     if not has_audio:
         return ["-an"]
 
-    audio_opt = str(settings.get("audio", "auto")).lower()
+    audio_opt = canonical_audio(str(settings.get("audio", "auto")))
     if audio_opt == "mute":
         return ["-an"]
     if audio_opt == "copy":
@@ -481,7 +446,7 @@ def parse_target_size(val: str | float, source_bytes: int = 0) -> int | None:
         return int(val)
     if not isinstance(val, str):
         return None
-    val_str = val.strip().lower()
+    val_str = canonical_target_size(val)
     if val_str.endswith("%"):
         try:
             pct = float(val_str[:-1]) / 100.0
@@ -520,10 +485,15 @@ def calculate_target_bitrate(
 
 
 def get_target_bytes(settings: dict, source_bytes: int = 0) -> int | None:
+    mode = settings.get("mode")
+    if mode == "crf":
+        return None
     target = settings.get("target_size")
     if target:
         return parse_target_size(target, source_bytes)
-    quality = str(settings.get("quality", "")).lower()
+    if mode == "size":
+        return None
+    quality = canonical_target_size(str(settings.get("quality", "")))
     if quality in ("10mb", "20mb", "50mb", "50%", "25%") or quality.endswith(
         ("%", "mb")
     ):
@@ -539,6 +509,15 @@ def parse_out_time(value: str) -> float:
         return 0.0
 
 
+def _tune_args(codec_name: str, settings: dict) -> list[str]:
+    tune = str(settings.get("tune", "none")).lower()
+    if codec_name == "libx264" and tune in ("film", "animation"):
+        return ["-tune", tune]
+    if codec_name == "libx265" and tune == "animation":
+        return ["-tune", tune]
+    return []
+
+
 def build_ffmpeg_args(
     src: Path,
     dst: Path,
@@ -550,6 +529,11 @@ def build_ffmpeg_args(
     target_bitrate: int | None = None,
 ) -> list[str]:
     settings = settings or DEFAULT_SETTINGS
+    video_map = (
+        f"0:{info['video_stream_index']}"
+        if info and "video_stream_index" in info
+        else "0:v:0"
+    )
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -562,7 +546,7 @@ def build_ffmpeg_args(
         "-i",
         str(src),
         "-map",
-        "0:v:0",
+        video_map,
     ]
 
     vf = build_video_filter(kind, settings, info)
@@ -665,6 +649,7 @@ def build_ffmpeg_args(
                 ]
             )
 
+        cmd.extend(_tune_args(codec_name, settings))
         if pass_num == 1:
             cmd.extend(["-an", "-f", "null", "/dev/null"])
             return cmd
@@ -673,7 +658,14 @@ def build_ffmpeg_args(
         # CRF mode
         quality_key = settings.get("quality", "balanced")
         quality = QUALITIES.get(quality_key, QUALITIES["balanced"])
-        crf = quality[2]
+        try:
+            crf = (
+                int(settings["crf"])
+                if settings.get("crf") is not None
+                else quality[2]
+            )
+        except (TypeError, ValueError):
+            crf = quality[2]
         if kind == "video_note":
             crf = min(51, crf + 2)
 
@@ -764,9 +756,12 @@ def build_ffmpeg_args(
                 ]
             )
 
+    if pass_num is None:
+        cmd.extend(_tune_args(codec_name, settings))
+
     # Audio mapping and flags (for 1-pass CRF or pass 2)
     has_audio = info.get("has_audio", True) if info else True
-    audio_opt = str(settings.get("audio", "auto")).lower()
+    audio_opt = canonical_audio(str(settings.get("audio", "auto")))
     if has_audio and audio_opt != "mute":
         cmd.extend(["-map", "0:a:0?"])
     audio_args = build_audio_args(settings, info)
@@ -801,6 +796,7 @@ def _run_ffmpeg_step(
     job_id: str | None = None,
     max_duration: int = 3600,
     is_cancelled: Callable[[], bool] | None = None,
+    on_process: Callable[[subprocess.Popen], None] | None = None,
 ) -> None:
     timed_out = False
     process = None
@@ -816,10 +812,14 @@ def _run_ffmpeg_step(
                 pass
 
     try:
+        if (is_cancelled and is_cancelled()) or is_job_cancelled(job_id):
+            raise BotError("Compression was cancelled")
         with err_file.open("wb") as errors:
             process = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=errors, text=True
             )
+            if on_process:
+                on_process(process)
             if job_id:
                 register_process(job_id, process)
             watchdog = threading.Timer(max_duration, kill_on_timeout)
@@ -883,6 +883,7 @@ def compress(
     max_duration: int = 3600,
     job_id: str | None = None,
     is_cancelled: Callable[[], bool] | None = None,
+    on_process: Callable[[subprocess.Popen], None] | None = None,
 ) -> MediaInfo:
     settings = settings or DEFAULT_SETTINGS
     info = probe(src)
@@ -898,7 +899,7 @@ def compress(
 
     if target_bytes and target_bytes > 0:
         # 2-Pass Target Size Mode
-        audio_opt = str(settings.get("audio", "auto")).lower()
+        audio_opt = canonical_audio(str(settings.get("audio", "auto")))
         if not info.get("has_audio") or audio_opt == "mute":
             audio_bps = 0
         elif audio_opt == "opus_64k":
@@ -939,6 +940,7 @@ def compress(
                 job_id=job_id,
                 max_duration=max_duration,
                 is_cancelled=is_cancelled,
+                on_process=on_process,
             )
 
             # Pass 2
@@ -963,6 +965,7 @@ def compress(
                 job_id=job_id,
                 max_duration=max_duration,
                 is_cancelled=is_cancelled,
+                on_process=on_process,
             )
         finally:
             # Cleanup pass log files
@@ -992,6 +995,7 @@ def compress(
             job_id=job_id,
             max_duration=max_duration,
             is_cancelled=is_cancelled,
+            on_process=on_process,
         )
 
     return probe(dst)

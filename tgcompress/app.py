@@ -16,7 +16,7 @@ from .media import pick_media
 from .mtproto import MTProtoClient
 from .pipeline import Pipeline
 from .queue import BatchCache
-from .state import StateStore
+from .state import StateError, StateStore, conversation_key
 from .telegram_api import BotApi
 from .transfer import Transfer
 from .ui import CardRenderer
@@ -52,6 +52,18 @@ class WorkerPool:
             t.join(timeout=timeout)
         with self.lock:
             return any(t.is_alive() for t in self.workers)
+
+
+def _message_from_item(state: dict, item: dict) -> dict:
+    kind = item.get("kind")
+    if kind not in ("video", "video_note", "document"):
+        kind = "video"
+    return {
+        "chat": {"id": item.get("chat_id", state.get("chat_id"))},
+        "from": {"id": state["user_id"]},
+        "message_id": item["message_id"],
+        kind: item["media"],
+    }
 
 
 def run(config: Config) -> None:
@@ -95,6 +107,59 @@ def run(config: Config) -> None:
     started = time.time()
     deadline = started + config.run_seconds - config.reserve_seconds
     offset = None
+
+    def process_single(message: dict) -> bool:
+        try:
+            handlers.handle_message(message, deadline)
+            return True
+        except Defer:
+            print("Deferred to the next shift.", flush=True)
+            return False
+        except BotError as exc:
+            print(f"handle: {config.redact(exc)}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"handle: unexpected {type(exc).__name__}: "
+                f"{config.redact(exc)}",
+                flush=True,
+            )
+        return True
+
+    def resume_singles(messages: list[dict]) -> None:
+        for pending_message in messages:
+            if not process_single(pending_message):
+                break
+
+    for state in store.states():
+        if not state.get("resume"):
+            continue
+        if state.get("mode") == "batch":
+            if state.get("queue"):
+                try:
+                    error = batch.start(state, deadline, state.get("chat_id"))
+                except StateError as exc:
+                    print(f"resume batch: {config.redact(exc)}", flush=True)
+                    continue
+                if error:
+                    print(f"resume batch: {error}", flush=True)
+            continue
+        pending_by_id = {
+            int(message["message_id"]): message
+            for message in state.get("pending", [])
+            if int(message["message_id"]) not in state.get("receipts", [])
+        }
+        messages = []
+        for item in state.get("queue", []):
+            message_id = int(item["message_id"])
+            if message_id in state.get("receipts", []):
+                continue
+            messages.append(
+                pending_by_id.pop(message_id, _message_from_item(state, item))
+            )
+        messages.extend(pending_by_id.values())
+        if messages:
+            worker_pool.dispatch(resume_singles, messages)
+
     try:
         while time.time() < deadline:
             try:
@@ -123,9 +188,7 @@ def run(config: Config) -> None:
                     # Immediate cancellation if /cancel or cancel
                     if text.lower() in ("/cancel", "cancel"):
                         if hasattr(pipeline, "registry") and user_id:
-                            pipeline.registry.cancel(user_id)
-                            if chat_id:
-                                pipeline.registry.cancel(chat_id)
+                            pipeline.registry.cancel(conversation_key(chat_id, user_id))
                         try:
                             handlers.handle_message(msg, deadline)
                         except BotError as exc:
@@ -157,26 +220,20 @@ def run(config: Config) -> None:
                         offset = update["update_id"] + 1
                         continue
 
-                    # Media in single-mode: dispatch to background worker so polling never blocks
+                    # Media in single-mode: persist before dispatch and acknowledgement.
                     found = pick_media(msg)
                     state = store.get(user_id, chat_id) if user_id else None
                     if found and (state is None or state.get("mode") != "batch"):
-
-                        def process_single(m: dict) -> None:
+                        if state is None:
+                            worker_pool.dispatch(process_single, msg)
+                        else:
                             try:
-                                handlers.handle_message(m, deadline)
-                            except Defer:
-                                print("Deferred to the next shift.", flush=True)
-                            except BotError as exc:
-                                print(f"handle: {config.redact(exc)}", flush=True)
-                            except Exception as exc:  # noqa: BLE001
-                                print(
-                                    f"handle: unexpected {type(exc).__name__}: "
-                                    f"{config.redact(exc)}",
-                                    flush=True,
-                                )
-
-                        worker_pool.dispatch(process_single, msg)
+                                is_new = store.add_pending(state, msg)
+                            except StateError as exc:
+                                print(f"pending: {config.redact(exc)}", flush=True)
+                                return
+                            if is_new:
+                                worker_pool.dispatch(process_single, msg)
                         offset = update["update_id"] + 1
                         continue
 
@@ -198,8 +255,9 @@ def run(config: Config) -> None:
                     cq = update["callback_query"]
                     if cq.get("data") == "multi:cancel":
                         cq_user = (cq.get("from") or {}).get("id")
+                        cq_chat = ((cq.get("message") or {}).get("chat") or {}).get("id")
                         if cq_user and hasattr(pipeline, "registry"):
-                            pipeline.registry.cancel(cq_user)
+                            pipeline.registry.cancel(conversation_key(cq_chat, cq_user))
                     try:
                         handlers.handle_callback(cq, deadline)
                     except BotError as exc:
@@ -212,10 +270,22 @@ def run(config: Config) -> None:
                         )
                 offset = update["update_id"] + 1
     finally:
-        store.save()
+        try:
+            store.save()
+        except StateError as exc:
+            print(f"shift state: {config.redact(exc)}", flush=True)
         stop_at = started + config.run_seconds
         batch_alive = batch.join_all(stop_at)
         worker_alive = worker_pool.join_all(stop_at)
+        try:
+            store.save()
+        except StateError as exc:
+            print(f"shift state: {config.redact(exc)}", flush=True)
+        if offset is not None:
+            try:
+                api.get_updates(offset, timeout=0)
+            except BotError as exc:
+                print(f"shutdown getUpdates: {config.redact(exc)}", flush=True)
         if batch_alive or worker_alive:
             print("Jobs still running; leaving temp files.", flush=True)
         else:

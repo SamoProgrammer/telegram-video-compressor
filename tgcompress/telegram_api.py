@@ -9,7 +9,7 @@ from pathlib import Path
 import requests
 import requests.adapters
 
-from .errors import BotError
+from .errors import BotError, UploadTooLarge
 
 DEFAULT_TIMEOUT = 600
 
@@ -98,6 +98,9 @@ class BotApi:
             except requests.RequestException:
                 raise BotError(f"{method}: network error") from None
 
+            if response.status_code == 413:
+                raise UploadTooLarge(f"{method}: Request Entity Too Large")
+
             if response.status_code == 429 and attempt < self.max_retries:
                 retry_after = self._extract_retry_after(response)
                 if not retry_after:
@@ -116,6 +119,11 @@ class BotApi:
                 description = (
                     payload.get("description") or f"HTTP {response.status_code}"
                 )
+                size_error = "request entity too large" in description.lower()
+                if payload.get("error_code") == 413 or (
+                    method.startswith("send") and size_error
+                ):
+                    raise UploadTooLarge(f"{method}: {description}")
                 raise BotError(f"{method}: {description}")
             return payload["result"]
 
@@ -136,6 +144,10 @@ class BotApi:
                 )
             except requests.RequestException:
                 raise BotError("getUpdates: network error") from None
+
+            if response.status_code >= 500 and attempt < self.max_retries:
+                self.sleep_fn(2**attempt)
+                continue
 
             if response.status_code == 429 and attempt < self.max_retries:
                 retry_after = self._extract_retry_after(response)

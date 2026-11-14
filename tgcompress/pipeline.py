@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import inspect
-import subprocess
 import threading
 import time
 from pathlib import Path
@@ -96,7 +95,6 @@ class ExecutionRegistry:
 
 
 TRANSCODE_SEMAPHORE = threading.Semaphore(1)
-registry = ExecutionRegistry()
 
 
 class Pipeline:
@@ -113,8 +111,19 @@ class Pipeline:
         self.transfer = transfer
         self.probe = probe_fn
         self.compress = compress_fn
-        self.registry = registry or globals()["registry"]
+        self.registry = registry or ExecutionRegistry()
         self.transcode_semaphore = transcode_semaphore or TRANSCODE_SEMAPHORE
+
+    def _status(self, report):
+        def say(phase: str, percent: int | None = None) -> None:
+            if not report:
+                return
+            try:
+                report(phase, percent)
+            except BotError as exc:
+                print(f"status update: {self.config.redact(exc)}", flush=True)
+
+        return say
 
     def download_one(
         self,
@@ -123,9 +132,7 @@ class Pipeline:
         media: dict,
         report=None,
     ) -> Path:
-        def say(phase: str, percent: int | None = None) -> None:
-            if report:
-                report(phase, percent)
+        say = self._status(report)
 
         say("⏳ downloading")
         return self.transfer.download(
@@ -143,32 +150,23 @@ class Pipeline:
         duration: float = 0.0,
         deadline: float | None = None,
         report=None,
-        user_id: int | None = None,
+        user_id: Any | None = None,
     ) -> dict:
-        def say(phase: str, percent: int | None = None) -> None:
-            if report:
-                report(phase, percent)
+        say = self._status(report)
 
         if deadline and duration and time.time() + duration + 120 > deadline:
             say("⏳ shift too short — retried next shift")
             raise Defer
 
         reg_key = user_id if user_id is not None else str(src)
-        self.registry.clear_cancel(reg_key)
         out_kind, fallback = target_kind(kind, settings, duration)
         out = self.config.work_dir / f"out-{time.time_ns()}.mp4"
-
-        orig_popen = subprocess.Popen
-
-        def tracked_popen(*args, **kwargs):
-            proc = orig_popen(*args, **kwargs)
-            self.registry.register(reg_key, proc)
-            return proc
 
         comp_kwargs: dict[str, Any] = {
             "duration": duration,
             "on_percent": lambda pct: say("⚙️ compressing", pct),
             "max_duration": self.config.max_duration,
+            "is_cancelled": lambda: self.registry.is_cancelled(reg_key),
         }
         for opt in (
             "codec",
@@ -198,9 +196,9 @@ class Pipeline:
 
         with self.transcode_semaphore:
             if self.registry.is_cancelled(reg_key):
+                self.registry.clear_cancel(reg_key)
                 raise BotError("Transcode cancelled")
             say("⚙️ compressing")
-            subprocess.Popen = tracked_popen
             try:
                 info = self.compress(src, out, out_kind, settings, **comp_kwargs)
             except Exception:
@@ -208,7 +206,6 @@ class Pipeline:
                     raise BotError("Transcode cancelled") from None
                 raise
             finally:
-                subprocess.Popen = orig_popen
                 self.registry.unregister(reg_key)
 
         in_mb = src.stat().st_size / 1048576
@@ -217,7 +214,7 @@ class Pipeline:
             limit = (
                 "~2000 MB"
                 if self.config.mt_ready
-                else f"{self.config.max_output_mb} MB"
+                else f"{self.config.upload_limit_bytes / 1048576:.1f} MiB"
             )
             raise BotError(
                 f"Compressed file is {out_mb:.1f} MB; the upload limit is "
@@ -250,9 +247,7 @@ class Pipeline:
         fallback: bool = False,
         report=None,
     ) -> dict:
-        def say(phase: str, percent: int | None = None) -> None:
-            if report:
-                report(phase, percent)
+        say = self._status(report)
 
         try:
             if out is None or out_mb >= in_mb * 0.98:
@@ -316,11 +311,9 @@ class Pipeline:
         path: Path | None = None,
         filename: str = "compressed.mp4",
         report=None,
-        user_id: int | None = None,
+        user_id: Any | None = None,
     ) -> dict:
-        def say(phase: str, percent: int | None = None) -> None:
-            if report:
-                report(phase, percent)
+        say = self._status(report)
 
         say("⏳ downloading")
         src = path
@@ -375,3 +368,4 @@ class Pipeline:
         finally:
             for leftover in (src, out):
                 safe_unlink(leftover, self.config.work_dir)
+            self.registry.clear_cancel(user_id or chat_id)

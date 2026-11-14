@@ -1,6 +1,9 @@
 import json
 import tempfile
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from tgcompress.ui import card_kb, card_text, persistent_reply_keyboard
@@ -96,6 +99,55 @@ class CardTest(unittest.TestCase):
         callbacks = [b["callback_data"] for row in keyboard for b in row]
         self.assertIn("multi:clear_confirm", callbacks)
         self.assertIn("menu:main", callbacks)
+
+    def test_large_batches_are_bounded_in_both_views(self):
+        state = self.stack.store.get(70, 1)
+        items = [
+            {
+                "name": f"clip-{index:03d}.mp4",
+                "size": 2 * 1048576,
+                "status": "⚙️ compressing " + "x" * 100,
+            }
+            for index in range(100)
+        ]
+        for processing in (False, True):
+            with self.subTest(processing=processing):
+                state["processing"] = processing
+                state["working"] = items if processing else []
+                state["queue"] = [] if processing else items
+                state["mode"] = "batch"
+                body = card_text(state, self.stack.config)
+                self.assertLessEqual(len(body), 4000)
+                self.assertIn("clip-000.mp4", body)
+                self.assertIn("more", body)
+
+    def test_concurrent_card_refreshes_are_serialized(self):
+        state = self.stack.store.get(70, 1)
+        original_call = self.stack.api.call
+        counter_lock = threading.Lock()
+        active = 0
+        overlapped = False
+
+        def tracked_call(method, files=None, **params):
+            nonlocal active, overlapped
+            with counter_lock:
+                active += 1
+                overlapped = overlapped or active > 1
+            time.sleep(0.005)
+            try:
+                return original_call(method, files=files, **params)
+            finally:
+                with counter_lock:
+                    active -= 1
+
+        self.stack.api.call = tracked_call
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(self.stack.cards.refresh, state)
+            second = pool.submit(self.stack.cards.refresh, state)
+            first.result()
+            second.result()
+
+        self.assertFalse(overlapped)
 
     def test_persistent_reply_keyboard(self):
         kb_json = persistent_reply_keyboard()

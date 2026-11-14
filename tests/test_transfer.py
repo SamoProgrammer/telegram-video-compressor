@@ -1,10 +1,12 @@
+import io
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from tgcompress.config import MT_UPLOAD_LIMIT_BYTES
-from tgcompress.errors import BotError
+from tgcompress.errors import BotError, UploadTooLarge
 from tgcompress.files import safe_unlink
 from tgcompress.mtproto import MTProtoClient, mt_regions
 from tgcompress.transfer import BOT_API_UPLOAD_CAP, Transfer
@@ -21,7 +23,7 @@ class LimitTest(unittest.TestCase):
     def test_limits_extend_with_mtproto(self):
         plain = make_config(self.tmp)
         self.assertEqual(plain.input_limit_bytes, 20 * 1024 * 1024)
-        self.assertEqual(plain.upload_limit_bytes, 50 * 1024 * 1024)
+        self.assertEqual(plain.upload_limit_bytes, BOT_API_UPLOAD_CAP)
 
         mt = make_config(self.tmp, telegram_api_id=1, telegram_api_hash="hash")
         self.assertEqual(mt.input_limit_bytes, MT_UPLOAD_LIMIT_BYTES)
@@ -106,7 +108,7 @@ class SendResultRoutingTest(unittest.TestCase):
         self.assertEqual(len(api.calls), 1)
         self.assertEqual(api.calls[0][0], "sendVideo")
 
-    def test_routes_large_file_to_bot_api_when_mtproto_not_ready(self):
+    def test_rejects_oversize_without_mtproto(self):
         config = make_config(self.tmp, telegram_api_id=0, telegram_api_hash="")
         api = FakeApi()
         mtproto = StubMTProto()
@@ -116,16 +118,117 @@ class SendResultRoutingTest(unittest.TestCase):
         path.write_bytes(b"x")
         with patch.object(Path, "stat") as mock_stat:
             mock_stat.return_value = MagicMock(st_size=BOT_API_UPLOAD_CAP + 1024)
+            with self.assertRaises(UploadTooLarge):
+                transfer.send_result(
+                    chat_id=123,
+                    message_id=456,
+                    path=path,
+                    kind="video",
+                    info={"width": 1920, "height": 1080, "duration": 60},
+                    caption="test",
+                )
+        self.assertEqual(len(mtproto.uploads), 0)
+        self.assertEqual(api.calls, [])
+
+
+class OversizeRecoveryTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.tmp = Path(self.dir.name)
+
+    def test_explicit_cloud_rejection_falls_back_to_mtproto(self):
+        class OversizeApi(FakeApi):
+            def call(self, method, files=None, **params):
+                raise UploadTooLarge(f"{method}: Request Entity Too Large")
+
+        config = make_config(self.tmp, telegram_api_id=1, telegram_api_hash="hash")
+        mtproto = StubMTProto()
+        transfer = Transfer(config, OversizeApi(), mtproto)
+        path = self.tmp / "output.mp4"
+        path.write_bytes(b"x" * 1024)
+
+        transfer.send_result(
+            chat_id=1,
+            message_id=2,
+            path=path,
+            kind="video",
+            info={"width": 640, "height": 360, "duration": 1},
+            caption="test",
+        )
+
+        self.assertEqual(len(mtproto.uploads), 1)
+
+    def test_real_file_above_cloud_cap_never_calls_bot_api(self):
+        config = make_config(self.tmp, telegram_api_id=1, telegram_api_hash="hash")
+        api = FakeApi()
+        mtproto = StubMTProto()
+        transfer = Transfer(config, api, mtproto)
+        path = self.tmp / "output.mp4"
+        with path.open("wb") as handle:
+            handle.truncate(BOT_API_UPLOAD_CAP + 1)
+
+        output = io.StringIO()
+        with redirect_stdout(output):
             transfer.send_result(
-                chat_id=123,
-                message_id=456,
+                chat_id=1,
+                message_id=2,
                 path=path,
                 kind="video",
-                info={"width": 1920, "height": 1080, "duration": 60},
+                info={"width": 640, "height": 360, "duration": 1},
                 caption="test",
             )
-        self.assertEqual(len(mtproto.uploads), 0)
+
+        self.assertEqual(api.calls, [])
+        self.assertEqual(len(mtproto.uploads), 1)
+        self.assertIn(f"size_bytes={BOT_API_UPLOAD_CAP + 1}", output.getvalue())
+        self.assertIn("route=mtproto", output.getvalue())
+
+    def test_cloud_only_oversize_fails_before_doomed_upload(self):
+        config = make_config(self.tmp)
+        api = FakeApi()
+        transfer = Transfer(config, api, StubMTProto())
+        path = self.tmp / "output.mp4"
+        with path.open("wb") as handle:
+            handle.truncate(BOT_API_UPLOAD_CAP + 1)
+
+        with self.assertRaisesRegex(UploadTooLarge, "MTProto"):
+            transfer.send_result(
+                chat_id=1,
+                message_id=2,
+                path=path,
+                kind="video",
+                info={"width": 640, "height": 360, "duration": 1},
+                caption="test",
+            )
+        self.assertEqual(api.calls, [])
+
+    def test_local_api_uses_its_larger_limit_before_mtproto(self):
+        config = make_config(
+            self.tmp,
+            api_base="http://127.0.0.1:8081",
+            max_output_mb=2000,
+            telegram_api_id=1,
+            telegram_api_hash="hash",
+        )
+        api = FakeApi()
+        mtproto = StubMTProto()
+        transfer = Transfer(config, api, mtproto)
+        path = self.tmp / "output.mp4"
+        with path.open("wb") as handle:
+            handle.truncate(BOT_API_UPLOAD_CAP + 1)
+
+        transfer.send_result(
+            chat_id=1,
+            message_id=2,
+            path=path,
+            kind="video",
+            info={"width": 640, "height": 360, "duration": 1},
+            caption="test",
+        )
+
         self.assertEqual(len(api.calls), 1)
+        self.assertEqual(mtproto.uploads, [])
 
 
 class SafeUnlinkTest(unittest.TestCase):

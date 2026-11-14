@@ -106,8 +106,9 @@ class BatchCache:
 
 
 class PrefetchQueue:
-    """JIT pipelined double-buffering prefetcher.
+    """Standalone JIT prefetcher retained for API compatibility.
 
+    Production BatchRunner owns its executor directly so shutdown joins transfers.
     Coordinates execution such that while item N is actively being processed/encoded,
     item N+1 is being prefetched in the background.
     Maintains at most max_buffer (default 2) items on disk simultaneously.

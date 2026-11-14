@@ -3,7 +3,7 @@ import unittest
 
 import requests
 
-from tgcompress.errors import BotError
+from tgcompress.errors import BotError, UploadTooLarge
 from tgcompress.telegram_api import BotApi, UploadMeter
 
 
@@ -165,6 +165,28 @@ class ApiTest(unittest.TestCase):
         )
         self.assertEqual(stream.tell(), 0)
 
+    def test_get_updates_retries_transient_server_error(self):
+        responses = [Response({}, status_code=502), Response({"ok": True, "result": []})]
+        sleeps = []
+
+        class TransientHttp:
+            def __init__(self):
+                self.calls = 0
+
+            def get(self, url, params=None, timeout=None):
+                response = responses[self.calls]
+                self.calls += 1
+                return response
+
+        api = BotApi(
+            "token",
+            "https://api.telegram.org",
+            http=TransientHttp(),
+            sleep_fn=sleeps.append,
+        )
+        self.assertEqual(api.get_updates(offset=None), [])
+        self.assertEqual(sleeps, [1])
+
     def test_get_updates_retries_on_429(self):
         responses = [
             Response(
@@ -193,6 +215,32 @@ class ApiTest(unittest.TestCase):
         updates = api.get_updates(offset=None)
         self.assertEqual(updates, [{"update_id": 100}])
         self.assertEqual(sleeps, [3])
+
+
+class UploadTooLargeTest(unittest.TestCase):
+    def test_http_413_is_classified_even_without_json(self):
+        class TooLargeHttp(FakeHttp):
+            def post(self, url, data=None, files=None, timeout=None):
+                return Response({}, status_code=413)
+
+        api = BotApi("token", "https://api.telegram.org", http=TooLargeHttp())
+        with self.assertRaises(UploadTooLarge):
+            api.call("sendVideo")
+
+    def test_telegram_entity_too_large_is_classified(self):
+        class TooLargeHttp(FakeHttp):
+            def post(self, url, data=None, files=None, timeout=None):
+                return Response(
+                    {
+                        "ok": False,
+                        "error_code": 400,
+                        "description": "Request Entity Too Large",
+                    }
+                )
+
+        api = BotApi("token", "https://api.telegram.org", http=TooLargeHttp())
+        with self.assertRaises(UploadTooLarge):
+            api.call("sendVideo")
 
 
 class UploadMeterTest(unittest.TestCase):

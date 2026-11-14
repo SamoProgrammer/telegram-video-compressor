@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 # Telegram's hard cap for bot transfers over MTProto, with headroom.
+# Keep headroom for multipart framing below the cloud API's 50 MB limit.
+CLOUD_UPLOAD_LIMIT_BYTES = 49 * 1024 * 1024
 MT_UPLOAD_LIMIT_BYTES = 1900 * 1024 * 1024
 
 
@@ -49,6 +51,19 @@ class Config:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "api_base", self.api_base.rstrip("/"))
+        for name in (
+            "run_seconds",
+            "max_input_mb",
+            "max_output_mb",
+            "max_duration",
+            "disk_budget_mb",
+        ):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be greater than zero")
+        if self.reserve_seconds < 0:
+            raise ValueError("reserve_seconds cannot be negative")
+        if self.reserve_seconds >= self.run_seconds:
+            raise ValueError("reserve_seconds must be less than run_seconds")
 
     @classmethod
     def from_env(cls) -> Config:
@@ -95,6 +110,17 @@ class Config:
         return bool(self.telegram_api_id and self.telegram_api_hash)
 
     @property
+    def using_cloud_api(self) -> bool:
+        return self.api_base == "https://api.telegram.org"
+
+    @property
+    def bot_api_upload_limit_bytes(self) -> int:
+        configured = self.max_output_mb * 1024 * 1024
+        if self.using_cloud_api:
+            return min(configured, CLOUD_UPLOAD_LIMIT_BYTES)
+        return configured
+
+    @property
     def input_limit_bytes(self) -> int:
         if self.mt_ready:
             return MT_UPLOAD_LIMIT_BYTES
@@ -104,7 +130,7 @@ class Config:
     def upload_limit_bytes(self) -> int:
         if self.mt_ready:
             return MT_UPLOAD_LIMIT_BYTES
-        return self.max_output_mb * 1024 * 1024
+        return self.bot_api_upload_limit_bytes
 
     @property
     def disk_budget_bytes(self) -> int:

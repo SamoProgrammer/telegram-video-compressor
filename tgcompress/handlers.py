@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import subprocess
-import threading
 import time
 
-from . import media
 from .config import Config
 from .errors import BotError, Defer
 from .files import safe_unlink
@@ -18,6 +15,8 @@ from .media import (
     media_name,
     pick_media,
 )
+from .settings import canonical_audio, canonical_target_size
+from .state import StateError, conversation_key
 from .telegram_api import reply_parameters
 from .ui import (
     AUDIO_OPTIONS,
@@ -37,55 +36,6 @@ def whoami(user_id: int | None, username: str | None) -> str:
     return f"{user_id}" + (f" (@{username})" if username else "")
 
 
-class ProcessRegistry:
-    """Tracks active FFmpeg subprocesses to allow immediate graceful cancellation."""
-
-    def __init__(self) -> None:
-        self._procs: dict[int, subprocess.Popen] = {}
-        self._lock = threading.Lock()
-
-    def register(self, key: int, proc: subprocess.Popen) -> None:
-        with self._lock:
-            self._procs[key] = proc
-
-    def unregister(self, key: int) -> None:
-        with self._lock:
-            self._procs.pop(key, None)
-
-    def get(self, key: int) -> subprocess.Popen | None:
-        with self._lock:
-            return self._procs.get(key)
-
-    def kill(self, key: int | None = None) -> bool:
-        with self._lock:
-            if key is not None:
-                proc = self._procs.pop(key, None)
-                procs = [proc] if proc else []
-            else:
-                procs = list(self._procs.values())
-                self._procs.clear()
-        killed = False
-        for proc in procs:
-            if proc and proc.poll() is None:
-                killed = True
-                try:
-                    proc.terminate()
-                except OSError:
-                    pass
-
-                def _escalate(p: subprocess.Popen) -> None:
-                    try:
-                        p.wait(timeout=2.0)
-                    except (subprocess.TimeoutExpired, OSError):
-                        try:
-                            p.kill()
-                        except OSError:
-                            pass
-
-                threading.Thread(target=_escalate, args=(proc,), daemon=True).start()
-        return killed
-
-
 class Handlers:
     def __init__(
         self,
@@ -95,7 +45,6 @@ class Handlers:
         pipeline,
         batch,
         cache,
-        process_registry: ProcessRegistry | None = None,
     ) -> None:
         self.config = config
         self.store = store
@@ -103,7 +52,6 @@ class Handlers:
         self.pipeline = pipeline
         self.batch = batch
         self.cache = cache
-        self.process_registry = process_registry or ProcessRegistry()
 
     def _deny(self, chat_id: int, message_id: int, user_id, username) -> None:
         self.cards.api.call(
@@ -183,15 +131,9 @@ class Handlers:
             if state["processing"]:
                 state["cancel"] = True
                 if hasattr(self.batch, "cancel"):
-                    self.batch.cancel(user_id)
+                    self.batch.cancel(user_id, chat_id)
                 if hasattr(self.pipeline, "registry"):
-                    self.pipeline.registry.cancel(user_id)
-                    if chat_id:
-                        self.pipeline.registry.cancel(chat_id)
-                media.cancel_all_processes()
-                self.process_registry.kill(user_id)
-                self.process_registry.kill(chat_id)
-                self.process_registry.kill()
+                    self.pipeline.registry.cancel(conversation_key(chat_id, user_id))
                 state["note"] = "⏹ Cancelled by user"
             else:
                 state["mode"] = "single"
@@ -212,6 +154,13 @@ class Handlers:
                 text="Send a video, a round video message, or a video file.",
                 reply_parameters=reply_parameters(message_id),
             )
+            return
+        if message_id in state.get("receipts", []):
+            return
+        if state["mode"] == "batch" and any(
+            item.get("message_id") == message_id
+            for item in state.get("queue", []) + state.get("working", [])
+        ):
             return
 
         media_item, kind = found
@@ -236,6 +185,8 @@ class Handlers:
                 text=reason,
                 reply_parameters=reply_parameters(message_id),
             )
+            if state["mode"] == "single":
+                self.store.remove_pending(state, message_id)
             return
         if state["processing"]:
             self.cards.api.call(
@@ -247,6 +198,8 @@ class Handlers:
                 ),
                 reply_parameters=reply_parameters(message_id),
             )
+            if state["mode"] == "single":
+                self.store.remove_pending(state, message_id)
             return
 
         item = {
@@ -284,14 +237,29 @@ class Handlers:
             return
 
         if deadline and duration and time.time() + duration + 120 > deadline:
+            state["queue"] = [item] + [
+                queued
+                for queued in state["queue"]
+                if queued.get("message_id") != message_id
+            ]
+            state["working"] = []
+            state["resume"] = True
             state["note"] = (
                 "⏳ Not enough time left in this shift; queued for the next."
             )
+            self.store.save()
             self.cards.refresh(state)
             raise Defer
 
+        state["queue"] = [
+            queued
+            for queued in state["queue"]
+            if queued.get("message_id") != message_id
+        ]
         state["working"] = [item]
         state["processing"] = True
+        state["resume"] = True
+        self.store.save()
         self.cards.refresh(state)
         try:
             result = self.pipeline.compress_one(
@@ -302,6 +270,7 @@ class Handlers:
                 state["settings"],
                 deadline=deadline,
                 report=self.cards.report(state, item),
+                user_id=conversation_key(chat_id, user_id),
             )
             if "error" in result:
                 if state.get("cancel"):
@@ -309,11 +278,16 @@ class Handlers:
                 else:
                     item["status"] = f"❌ {result['error']}"[:120]
         except Defer:
+            state["queue"] = [item] + [
+                queued
+                for queued in state["queue"]
+                if queued.get("message_id") != message_id
+            ]
             state["working"] = []
             state["processing"] = False
-            state["note"] = (
-                "⏳ Shift too short — send it again after the next shift starts."
-            )
+            state["resume"] = True
+            state["note"] = "⏳ Shift too short — queued for the next shift."
+            self.store.save()
             self.cards.refresh(state)
             raise
         finally:
@@ -326,6 +300,16 @@ class Handlers:
             state["note"] = ""
         else:
             state["note"] = f"{result['error']}"[:180]
+        state["resume"] = False
+        if "error" not in result:
+            try:
+                self.store.record_receipt(state, message_id)
+            except StateError as exc:
+                print(f"single receipt: {self.config.redact(exc)}", flush=True)
+                state["note"] = f"❌ Delivery receipt failed: {exc}"[:180]
+                self.cards.refresh(state)
+                return
+        self.store.remove_pending(state, message_id)
         self.cards.refresh(state)
 
     def handle_callback(self, cq: dict, deadline: float | None = None) -> None:
@@ -428,7 +412,7 @@ class Handlers:
                     answer("Unknown option.", True)
                     return
             elif data.startswith("set:size:"):
-                value = data.split(":", 2)[2]
+                value = canonical_target_size(data.split(":", 2)[2])
                 if value not in dict(TARGET_SIZES):
                     answer("Unknown option.", True)
                     return
@@ -449,7 +433,7 @@ class Handlers:
                 settings["fps"] = value
                 answer("Option updated")
             elif data.startswith("set:audio:"):
-                value = data.split(":", 2)[2]
+                value = canonical_audio(data.split(":", 2)[2])
                 if value not in dict(AUDIO_OPTIONS):
                     answer("Unknown option.", True)
                     return
@@ -468,7 +452,15 @@ class Handlers:
                     answer("Unknown option.", True)
                     return
                 settings["tune"] = value
-                answer("Option updated")
+                codec = settings.get("codec")
+                if value == "none" or codec == "h264":
+                    answer("Option updated")
+                elif codec == "hevc" and value == "animation":
+                    answer("Option updated")
+                elif codec == "hevc":
+                    answer("Saved; Film tuning applies to H.264 only")
+                else:
+                    answer("Saved; this codec does not use encoder tuning")
             elif data.startswith("set:tonemap:"):
                 value = data.split(":", 2)[2]
                 if value not in ("auto", "on", "off"):
@@ -505,15 +497,9 @@ class Handlers:
                 if state["processing"]:
                     state["cancel"] = True
                     if hasattr(self.batch, "cancel"):
-                        self.batch.cancel(user_id)
+                        self.batch.cancel(user_id, chat_id)
                     if hasattr(self.pipeline, "registry"):
-                        self.pipeline.registry.cancel(user_id)
-                        if chat_id:
-                            self.pipeline.registry.cancel(chat_id)
-                    media.cancel_all_processes()
-                    self.process_registry.kill(user_id)
-                    self.process_registry.kill(chat_id)
-                    self.process_registry.kill()
+                        self.pipeline.registry.cancel(conversation_key(chat_id, user_id))
                     state["note"] = "⏹ Cancelled by user"
                     answer("Stopping after the current video.")
                 else:
