@@ -21,7 +21,6 @@ class FakeTransfer:
         if on_percent:
             on_percent(50)
         return self.src
-
     def send_original(self, *args, **kwargs):
         self.events.append("sendOriginal")
 
@@ -264,6 +263,39 @@ class ExecutionRegistryTest(unittest.TestCase):
             self.assertIn("cancelled", first["error"])
             self.assertNotIn("error", second)
             self.assertEqual(calls, 2)
+
+
+class ProbeReuseTest(unittest.TestCase):
+    def test_single_pipeline_probes_one_input_and_compression_reuses_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tmp = Path(directory)
+            src = tmp / "input.mp4"
+            src.write_bytes(b"x" * 1000)
+            probes = []
+            received = {}
+            info = {"width": 640, "height": 360, "duration": 1.0}
+
+            def fake_probe(path):
+                probes.append(path)
+                return info
+
+            def fake_compress(source, destination, kind, settings, **kwargs):
+                received.update(kwargs)
+                destination.write_bytes(b"compressed")
+                return info
+
+            pipeline = Pipeline(
+                make_config(tmp),
+                FakeTransfer(src),
+                probe_fn=fake_probe,
+                compress_fn=fake_compress,
+            )
+            result = pipeline.compress_one(
+                1, 2, {"file_id": "x"}, "video", dict(DEFAULT_SETTINGS)
+            )
+            self.assertNotIn("error", result)
+            self.assertEqual(probes, [src])
+            self.assertIs(received["probe_info"], info)
 
 
 class ProcessIsolationTest(unittest.TestCase):

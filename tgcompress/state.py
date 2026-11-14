@@ -32,6 +32,8 @@ PUBLIC_ITEM_KEYS = (
     "name",
     "filename",
     "duration",
+    "job_id",
+    "info",
 )
 
 PUBLIC_MESSAGE_KEYS = (
@@ -42,6 +44,7 @@ PUBLIC_MESSAGE_KEYS = (
     "video_note",
     "animation",
     "document",
+    "_job_id",
 )
 
 RECEIPT_LIMIT = 100

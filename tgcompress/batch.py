@@ -11,6 +11,7 @@ from pathlib import Path
 from .config import Config
 from .errors import BotError, Defer
 from .files import safe_unlink
+from .metrics import new_job_id
 from .pipeline import TRANSCODE_SEMAPHORE
 from .state import StateError, conversation_key
 from .ui import CardRenderer
@@ -129,7 +130,7 @@ class BatchRunner:
         state = self.store.get(user_id, chat_id)
         receipts = set(state.get("receipts", []))
         items = [
-            item
+            dict(item, job_id=item.get("job_id") or new_job_id())
             for item in state.get("working", [])
             if item.get("message_id") not in receipts
         ]
@@ -162,9 +163,12 @@ class BatchRunner:
                     target_item["message_id"],
                     target_item["media"],
                     report=self.cards.report(state, target_item),
+                    job_id=target_item["job_id"],
                 )
                 target_item["path"] = p
                 try:
+                    target_item["info"] = self.pipeline.probe(p)
+                    target_item["duration"] = target_item["info"]["duration"]
                     self._check_disk_space(items)
                 except BotError:
                     safe_unlink(p, self.config.work_dir)
@@ -206,6 +210,7 @@ class BatchRunner:
                         filename=cur_item["filename"],
                         fallback=cur_t_res["fallback"],
                         report=self.cards.report(state, cur_item),
+                        job_id=cur_item["job_id"],
                     )
                     return cur_item, res
                 finally:
@@ -288,7 +293,7 @@ class BatchRunner:
 
                     # 3. Transcode video N (strict Semaphore(1) ensures 100% CPU)
                     try:
-                        actual = self.pipeline.probe(src)
+                        actual = item.get("info") or self.pipeline.probe(src)
                         t_res = self.pipeline.transcode_one(
                             src=src,
                             kind=item["kind"],
@@ -297,6 +302,8 @@ class BatchRunner:
                             deadline=deadline,
                             report=self.cards.report(state, item),
                             user_id=conversation_key(chat_id, user_id),
+                            probe_info=actual,
+                            job_id=item["job_id"],
                         )
                         item["_output_path"] = t_res["out"]
                         self._check_disk_space(items)

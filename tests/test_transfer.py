@@ -40,9 +40,40 @@ class DownloadFallbackTest(unittest.TestCase):
         config = make_config(self.tmp, telegram_api_id=1, telegram_api_hash="hash")
         mtproto = StubMTProto()
         sentinel = self.tmp / "mt.bin"
-        mtproto.download = lambda chat_id, message_id, dest, on_percent=None: sentinel
+        mtproto.download = lambda chat_id, message_id, dest, on_percent=None, stats=None: sentinel
         transfer = Transfer(config, FakeApi(), mtproto)
         self.assertIs(transfer.download("big", chat_id=2, message_id=3), sentinel)
+
+    def test_large_cloud_download_prefers_bounded_mtproto(self):
+        config = make_config(self.tmp, telegram_api_id=1, telegram_api_hash="hash")
+        mtproto = StubMTProto()
+        api = MagicMock()
+        transfer = Transfer(config, api, mtproto)
+
+        transfer.download(
+            "large",
+            chat_id=2,
+            message_id=3,
+            media_size=9 * 1024 * 1024,
+            job_id="download-test",
+        )
+
+        api.get_file.assert_not_called()
+        self.assertEqual(len(mtproto.downloads), 1)
+
+    def test_small_cloud_download_keeps_bot_api_route(self):
+        config = make_config(self.tmp, telegram_api_id=1, telegram_api_hash="hash")
+        destination = self.tmp / "cloud.bin"
+        api = FakeApi()
+        destination.write_bytes(b"cloud")
+        api.get_file = lambda file_id: {
+            "file_path": str(destination),
+            "file_size": 1024,
+        }
+        transfer = Transfer(config, api, StubMTProto())
+        self.assertEqual(transfer.download(
+            "small", chat_id=2, message_id=3, media_size=1024
+        ), destination)
 
     def test_still_fails_without_mtproto(self):
         config = make_config(self.tmp)
@@ -260,6 +291,63 @@ class SafeUnlinkTest(unittest.TestCase):
     def test_none_or_missing_path_is_safe(self):
         safe_unlink(None, self.tmp)
         safe_unlink(self.tmp / "nonexistent.bin", self.tmp)
+
+
+class TransferConcurrencyTest(unittest.TestCase):
+    def test_download_pool_caps_connections_and_reuses_workers(self):
+        import concurrent.futures
+        import threading
+        import time
+
+        with tempfile.TemporaryDirectory() as directory:
+            gate = threading.Event()
+            two_entered = threading.Event()
+            lock = threading.Lock()
+            active = 0
+            maximum = 0
+            threads = set()
+            config = make_config(
+                Path(directory), telegram_api_id=1, telegram_api_hash="hash"
+            )
+            mtproto = StubMTProto()
+
+            def download(chat_id, message_id, dest, on_percent=None, stats=None):
+                nonlocal active, maximum
+                with lock:
+                    active += 1
+                    maximum = max(maximum, active)
+                    threads.add(threading.get_ident())
+                    if active == 2:
+                        two_entered.set()
+                gate.wait(2)
+                dest.write_bytes(b"payload")
+                with lock:
+                    active -= 1
+                return dest
+
+            mtproto.download = download
+            transfer = Transfer(config, FakeApi(), mtproto)
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=6) as callers:
+                    futures = [
+                        callers.submit(
+                            transfer.download,
+                            str(index),
+                            chat_id=2,
+                            message_id=index + 1,
+                            media_size=9 * 1024 * 1024,
+                        )
+                        for index in range(6)
+                    ]
+                    self.assertTrue(two_entered.wait(1))
+                    gate.set()
+                    for future in futures:
+                        future.result(timeout=2)
+                self.assertLessEqual(maximum, 2)
+                self.assertLessEqual(len(threads), 2)
+            finally:
+                close = getattr(transfer, "close", lambda: None)
+                close()
 
 
 class RegionsTest(unittest.TestCase):

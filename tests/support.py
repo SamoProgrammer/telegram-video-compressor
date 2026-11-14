@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import weakref
 from pathlib import Path
 
 from tgcompress.batch import BatchRunner
@@ -34,8 +35,10 @@ class StubMTProto:
         self.downloads: list[tuple] = []
         self.uploads: list[tuple] = []
 
-    def download(self, chat_id, message_id, dest, on_percent=None):
+    def download(self, chat_id, message_id, dest, on_percent=None, stats=None):
         self.downloads.append((chat_id, message_id, dest))
+        if stats is not None:
+            stats["connections"] = 4
         return dest
 
     def upload(self, *args, **kwargs):
@@ -61,6 +64,7 @@ class Stack:
             self.batch,
             self.cache,
         )
+        self.close = weakref.finalize(self, self.transfer.close)
 
 
 def make_config(tmp: Path, **overrides) -> Config:

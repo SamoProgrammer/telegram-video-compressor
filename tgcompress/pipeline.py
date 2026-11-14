@@ -11,7 +11,8 @@ from typing import Any
 from .config import Config
 from .errors import BotError, Defer
 from .files import safe_unlink
-from .media import compress, probe, settings_line, target_kind
+from .media import compress, get_target_bytes, probe, settings_line, target_kind
+from .metrics import new_job_id, stage
 from .transfer import Transfer
 
 CODEC_LABELS = {
@@ -131,6 +132,7 @@ class Pipeline:
         reply_to: int,
         media: dict,
         report=None,
+        job_id: str | None = None,
     ) -> Path:
         say = self._status(report)
 
@@ -140,6 +142,8 @@ class Pipeline:
             lambda pct: say("⏳ downloading", pct),
             chat_id=chat_id,
             message_id=reply_to,
+            job_id=job_id,
+            media_size=int(media.get("file_size") or 0),
         )
 
     def transcode_one(
@@ -151,7 +155,10 @@ class Pipeline:
         deadline: float | None = None,
         report=None,
         user_id: Any | None = None,
+        probe_info: Any | None = None,
+        job_id: str | None = None,
     ) -> dict:
+        job_id = job_id or new_job_id()
         say = self._status(report)
 
         if deadline and duration and time.time() + duration + 120 > deadline:
@@ -180,6 +187,9 @@ class Pipeline:
         ):
             if opt in settings:
                 comp_kwargs[opt] = settings[opt]
+        if probe_info is not None:
+            comp_kwargs["probe_info"] = probe_info
+        comp_kwargs["metrics_job_id"] = job_id
 
         sig = inspect.signature(self.compress)
         accepted = sig.parameters
@@ -199,14 +209,25 @@ class Pipeline:
                 self.registry.clear_cancel(reg_key)
                 raise BotError("Transcode cancelled")
             say("⚙️ compressing")
-            try:
-                info = self.compress(src, out, out_kind, settings, **comp_kwargs)
-            except Exception:
-                if self.registry.is_cancelled(reg_key):
-                    raise BotError("Transcode cancelled") from None
-                raise
-            finally:
-                self.registry.unregister(reg_key)
+            two_pass = bool(
+                get_target_bytes(settings, src.stat().st_size if src.exists() else 0)
+            )
+            with stage(
+                "encode",
+                job_id=job_id,
+                codec=str(settings.get("codec", "h264")),
+                passes=2 if two_pass else 1,
+                bytes=src.stat().st_size,
+            ) as stats:
+                try:
+                    info = self.compress(src, out, out_kind, settings, **comp_kwargs)
+                    stats["bytes"] = out.stat().st_size
+                except Exception:
+                    if self.registry.is_cancelled(reg_key):
+                        raise BotError("Transcode cancelled") from None
+                    raise
+                finally:
+                    self.registry.unregister(reg_key)
 
         in_mb = src.stat().st_size / 1048576
         out_mb = out.stat().st_size / 1048576
@@ -246,17 +267,18 @@ class Pipeline:
         filename: str = "compressed.mp4",
         fallback: bool = False,
         report=None,
+        job_id: str | None = None,
     ) -> dict:
         say = self._status(report)
 
         try:
             if out is None or out_mb >= in_mb * 0.98:
                 try:
-                    self.transfer.send_original(chat_id, reply_to, media, out_kind)
+                    self.transfer.send_original(chat_id, reply_to, media, out_kind, job_id)
                 except BotError:
                     if out_kind == kind:
                         raise
-                    self.transfer.send_original(chat_id, reply_to, media, kind)
+                    self.transfer.send_original(chat_id, reply_to, media, kind, job_id)
                 say(f"✅ sent original ({in_mb:.1f} MB)")
                 return {
                     "in": in_mb,
@@ -287,6 +309,7 @@ class Pipeline:
                 caption,
                 filename,
                 on_percent=lambda pct: say("📤 uploading", pct),
+                job_id=job_id,
             )
             say(f"✅ {in_mb:.1f} → {out_mb:.1f} MB ({saved:.0f}%)")
             return {
@@ -312,7 +335,9 @@ class Pipeline:
         filename: str = "compressed.mp4",
         report=None,
         user_id: Any | None = None,
+        job_id: str | None = None,
     ) -> dict:
+        job_id = job_id or new_job_id()
         say = self._status(report)
 
         say("⏳ downloading")
@@ -325,6 +350,7 @@ class Pipeline:
                     reply_to=reply_to,
                     media=media,
                     report=report,
+                    job_id=job_id,
                 )
             actual = self.probe(src)
             t_res = self.transcode_one(
@@ -335,6 +361,8 @@ class Pipeline:
                 deadline=deadline,
                 report=report,
                 user_id=user_id or chat_id,
+                probe_info=actual,
+                job_id=job_id,
             )
             out = t_res["out"]
             return self.upload_one(
@@ -352,6 +380,7 @@ class Pipeline:
                 filename=filename,
                 fallback=t_res["fallback"],
                 report=report,
+                job_id=job_id,
             )
         except Defer:
             raise

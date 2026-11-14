@@ -603,5 +603,60 @@ class HandlerTest(unittest.TestCase):
         self.assertEqual(state["queue"][0]["message_id"], 5)
 
 
+class SingleQueueTest(unittest.TestCase):
+    def test_second_single_waits_without_being_rejected_or_losing_pending(self):
+        import threading
+
+        with tempfile.TemporaryDirectory() as directory:
+            stack = make_stack(Path(directory))
+            state = stack.store.get(3, 1)
+            entered = threading.Event()
+            release = threading.Event()
+            calls = []
+
+            def compress(*args, **kwargs):
+                calls.append(args[1])
+                entered.set()
+                release.wait(2)
+                return {
+                    "in": 1.0,
+                    "out": 0.5,
+                    "saved": True,
+                    "kind": "video",
+                    "fallback": False,
+                }
+
+            stack.pipeline.compress_one = compress
+            first = message(message_id=5, video={
+                "file_id": "first", "file_size": 1000, "duration": 1,
+            })
+            second = message(message_id=6, video={
+                "file_id": "second", "file_size": 1000, "duration": 1,
+            })
+            stack.store.add_pending(state, first)
+            worker = threading.Thread(
+                target=stack.handlers.handle_message, args=(first,), daemon=True
+            )
+            worker.start()
+            self.assertTrue(entered.wait(1))
+            stack.store.add_pending(state, second)
+            stack.handlers.handle_message(second)
+
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(state["queue"][0]["message_id"], 6)
+            self.assertEqual(state["pending"][0]["message_id"], 5)
+            self.assertTrue(state["resume"])
+
+            release.set()
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+            self.assertTrue(state["resume"])
+            stack.handlers.handle_message(second)
+            self.assertEqual(calls, [5, 6])
+            self.assertEqual(state["queue"], [])
+            self.assertEqual(state["pending"], [])
+            self.assertFalse(state["resume"])
+
+
 if __name__ == "__main__":
     unittest.main()

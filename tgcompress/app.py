@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import queue
 import shutil
 import sys
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 
 from .batch import BatchRunner
@@ -22,36 +24,96 @@ from .transfer import Transfer
 from .ui import CardRenderer
 
 
+class _Job:
+    def __init__(self, target: Callable, args: tuple) -> None:
+        self.target = target
+        self.args = args
+        self.done = threading.Event()
+
+    def is_alive(self) -> bool:
+        return not self.done.is_set()
+
+
 class WorkerPool:
-    """Manages background worker threads for non-blocking task processing."""
+    """Bounded workers with FIFO queues per conversation and fair cross-key turns."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_workers: int = 4) -> None:
+        if max_workers < 1:
+            raise ValueError("max_workers must be positive")
         self.workers: set[threading.Thread] = set()
-        self.lock = threading.Lock()
-
-    def dispatch(self, target: Callable, *args) -> threading.Thread:
-        def runner() -> None:
-            try:
-                target(*args)
-            finally:
-                with self.lock:
-                    self.workers.discard(threading.current_thread())
-
-        thread = threading.Thread(target=runner, daemon=True)
-        with self.lock:
+        self._condition = threading.Condition()
+        self._keys: queue.Queue = queue.Queue()
+        self._queues: dict[object, deque[_Job]] = {}
+        self._pending = 0
+        self._closed = False
+        for index in range(max_workers):
+            thread = threading.Thread(
+                target=self._worker, name=f"conversation-{index}", daemon=True
+            )
             self.workers.add(thread)
-        thread.start()
-        return thread
+            thread.start()
+
+    def dispatch(self, target: Callable, *args, key=None) -> _Job:
+        job = _Job(target, args)
+        with self._condition:
+            if self._closed:
+                raise RuntimeError("Worker pool is closed")
+            key = key if key is not None else object()
+            self._pending += 1
+            if key not in self._queues:
+                self._queues[key] = deque()
+                self._keys.put(key)
+            self._queues[key].append(job)
+            self._condition.notify_all()
+        return job
+
+    def _worker(self) -> None:
+        while True:
+            key = self._keys.get()
+            if key is None:
+                self._keys.task_done()
+                return
+            with self._condition:
+                jobs = self._queues[key]
+                job = jobs.popleft()
+            try:
+                job.target(*job.args)
+            except Exception as exc:  # noqa: BLE001, process_single already contains its errors
+                print(f"worker: {type(exc).__name__}", flush=True)
+            finally:
+                with self._condition:
+                    if jobs:
+                        self._keys.put(key)
+                    else:
+                        self._queues.pop(key, None)
+                    self._pending -= 1
+                    self._condition.notify_all()
+                job.done.set()
+                self._keys.task_done()
 
     def join_all(self, stop_at: float) -> bool:
-        """Wait for workers until stop_at; return True if any is still alive."""
-        with self.lock:
-            threads = list(self.workers)
-        for t in threads:
-            timeout = max(0.0, stop_at - time.time())
-            t.join(timeout=timeout)
-        with self.lock:
-            return any(t.is_alive() for t in self.workers)
+        """Return whether work remains at stop_at; close idle workers otherwise."""
+        with self._condition:
+            while self._pending:
+                remaining = stop_at - time.time()
+                if remaining <= 0:
+                    return True
+                self._condition.wait(timeout=remaining)
+        self.close()
+        return False
+
+    def close(self) -> None:
+        with self._condition:
+            if self._pending:
+                raise RuntimeError("Cannot close workers with unfinished jobs")
+            if self._closed:
+                return
+            self._closed = True
+        for _ in self.workers:
+            self._keys.put(None)
+        for thread in self.workers:
+            thread.join()
+        self.workers.clear()
 
 
 def _message_from_item(state: dict, item: dict) -> dict:
@@ -62,6 +124,7 @@ def _message_from_item(state: dict, item: dict) -> dict:
         "chat": {"id": item.get("chat_id", state.get("chat_id"))},
         "from": {"id": state["user_id"]},
         "message_id": item["message_id"],
+        "_job_id": item.get("job_id"),
         kind: item["media"],
     }
 
@@ -109,6 +172,7 @@ def run(config: Config) -> None:
     offset = None
 
     def process_single(message: dict) -> bool:
+        """Each message is dispatched once; the keyed pool enforces FIFO."""
         try:
             handlers.handle_message(message, deadline)
             return True
@@ -158,7 +222,11 @@ def run(config: Config) -> None:
             )
         messages.extend(pending_by_id.values())
         if messages:
-            worker_pool.dispatch(resume_singles, messages)
+            worker_pool.dispatch(
+                resume_singles,
+                messages,
+                key=conversation_key(state.get("chat_id"), state["user_id"]),
+            )
 
     try:
         while time.time() < deadline:
@@ -225,7 +293,11 @@ def run(config: Config) -> None:
                     state = store.get(user_id, chat_id) if user_id else None
                     if found and (state is None or state.get("mode") != "batch"):
                         if state is None:
-                            worker_pool.dispatch(process_single, msg)
+                            worker_pool.dispatch(
+                                process_single,
+                                msg,
+                                key=conversation_key(chat_id, user_id),
+                            )
                         else:
                             try:
                                 is_new = store.add_pending(state, msg)
@@ -233,7 +305,11 @@ def run(config: Config) -> None:
                                 print(f"pending: {config.redact(exc)}", flush=True)
                                 return
                             if is_new:
-                                worker_pool.dispatch(process_single, msg)
+                                worker_pool.dispatch(
+                                    process_single,
+                                    msg,
+                                    key=conversation_key(chat_id, user_id),
+                                )
                         offset = update["update_id"] + 1
                         continue
 
@@ -289,6 +365,7 @@ def run(config: Config) -> None:
         if batch_alive or worker_alive:
             print("Jobs still running; leaving temp files.", flush=True)
         else:
+            transfer.close()
             shutil.rmtree(config.work_dir, ignore_errors=True)
         print("Shift over.", flush=True)
 

@@ -14,7 +14,7 @@ class InlineWorkerPool:
     def __init__(self):
         self.dispatched = []
 
-    def dispatch(self, target, *args):
+    def dispatch(self, target, *args, key=None):
         self.dispatched.append((target, args))
         target(*args)
 
@@ -189,6 +189,35 @@ class AppTest(unittest.TestCase):
 
         self.assertEqual(self.api.update_calls[-1], (10, 0))
         self.handlers.handle_message.assert_called_once()
+
+
+    def test_multiple_resumed_singles_fail_without_repeating_or_overtaking_fifo(self):
+        messages = [
+            self.media_message(1),
+            self.media_message(2),
+            self.media_message(3),
+        ]
+        self.write_state({
+            "user_id": 3,
+            "chat_id": 1,
+            "mode": "single",
+            "resume": True,
+            "pending": messages,
+        })
+        attempted = []
+
+        def handle(message, _deadline):
+            message_id = message["message_id"]
+            attempted.append(message_id)
+            state = self.created_store.get(3, 1)
+            self.created_store.remove_pending(state, message_id)
+            if message_id != 2:
+                self.created_store.record_receipt(state, message_id)
+
+        self.handlers.handle_message.side_effect = handle
+        app.run(self.config())
+
+        self.assertEqual(attempted, [1, 2, 3])
 
 
 if __name__ == "__main__":

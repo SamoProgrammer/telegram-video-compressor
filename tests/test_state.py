@@ -265,6 +265,39 @@ class StateTest(unittest.TestCase):
         self.store.load()
         self.assertEqual(self.store.get(1, 10)["cards"], [])
 
+    def test_probe_metadata_and_job_ids_survive_recovery(self):
+        state = self.store.get(1, 10)
+        info = {"width": 640, "height": 360, "duration": 2.0, "fps": 30.0}
+        state["queue"] = [{
+            "media": {"file_id": "clip", "file_size": 1000},
+            "kind": "video",
+            "chat_id": 10,
+            "message_id": 40,
+            "size": 1000,
+            "name": "clip",
+            "filename": "clip.mp4",
+            "duration": 2.0,
+            "job_id": "queued-job",
+            "info": info,
+        }]
+        pending = {
+            "chat": {"id": 10},
+            "from": {"id": 1},
+            "message_id": 5,
+            "_job_id": "pending-job",
+            "video": {"file_id": "other", "file_size": 500},
+        }
+        self.store.add_pending(state, pending)
+
+        restored = StateStore(self.path)
+        restored.load()
+
+        item = restored.get(1, 10)["queue"][0]
+        self.assertEqual(item["job_id"], "queued-job")
+        self.assertEqual(item["info"], info)
+        self.assertTrue(restored.get(1, 10)["resume"])
+        self.assertEqual(restored.get(1, 10)["pending"][0]["_job_id"], "pending-job")
+
     def test_save_creates_parents_and_reports_failures_without_secrets(self):
         nested = Path(self.dir.name) / "new" / "parents" / "state.json"
         store = StateStore(nested)

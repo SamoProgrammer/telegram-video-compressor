@@ -55,7 +55,7 @@ class PipelinedPipeline:
     def probe(self, path: Path):
         return {"width": 640, "height": 360, "duration": 1.0, "has_audio": False}
 
-    def download_one(self, chat_id, message_id, media, report=None):
+    def download_one(self, chat_id, message_id, media, report=None, **kwargs):
         fid = media.get("file_id", "clip")
         self.events.append(("download", fid))
         path = self.tmp / f"{fid}.mp4"
@@ -72,6 +72,7 @@ class PipelinedPipeline:
         deadline=None,
         report=None,
         user_id=None,
+        **kwargs,
     ):
         name = src.stem
         with self.lock:
@@ -110,6 +111,7 @@ class PipelinedPipeline:
         filename="compressed.mp4",
         fallback=False,
         report=None,
+        **kwargs,
     ):
         fid = media.get("file_id", "clip")
         self.events.append(("upload", fid))
@@ -281,7 +283,7 @@ class BatchTest(unittest.TestCase):
                 self.prefetch_started = threading.Event()
                 self.release_prefetch = threading.Event()
 
-            def download_one(self, chat_id, message_id, media, report=None):
+            def download_one(self, chat_id, message_id, media, report=None, **kwargs):
                 if media["file_id"] == "vid2":
                     self.prefetch_started.set()
                     self.release_prefetch.wait()
@@ -517,6 +519,49 @@ class WorkerPoolTest(unittest.TestCase):
         self.assertFalse(alive)
         self.assertTrue(done.is_set())
         self.assertEqual(len(pool.workers), 0)
+
+    def test_bounded_workers_preserve_per_conversation_fifo(self):
+        from tgcompress.app import WorkerPool
+
+        pool = WorkerPool(max_workers=2)
+        gate = threading.Event()
+        two_entered = threading.Event()
+        lock = threading.Lock()
+        active = 0
+        maximum = 0
+        ordered = []
+
+        def worker(key, index):
+            nonlocal active, maximum
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+                if active == 2:
+                    two_entered.set()
+            gate.wait(2)
+            with lock:
+                ordered.append((key, index))
+                active -= 1
+
+        handles = [
+            pool.dispatch(
+                worker,
+                ("chat", index % 2),
+                index,
+                key=("chat", index % 2),
+            )
+            for index in range(6)
+        ]
+        self.assertTrue(two_entered.wait(1))
+        self.assertEqual(len(pool.workers), 2)
+        gate.set()
+        self.assertFalse(pool.join_all(time.time() + 3))
+        self.assertTrue(all(not handle.is_alive() for handle in handles))
+        self.assertEqual(maximum, 2)
+        first_key = "chat", 0
+        self.assertEqual(
+            [index for key, index in ordered if key == first_key], [0, 2, 4]
+        )
 
 
 if __name__ == "__main__":

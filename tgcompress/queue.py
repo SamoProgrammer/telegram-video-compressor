@@ -10,6 +10,7 @@ from .config import Config
 from .errors import BotError
 from .files import safe_unlink
 from .media import probe
+from .metrics import new_job_id
 from .transfer import Transfer
 
 MAX_ON_DISK = 2
@@ -85,6 +86,8 @@ class BatchCache:
                 on_percent,
                 chat_id=item.get("chat_id"),
                 message_id=item.get("message_id"),
+                job_id=item.setdefault("job_id", new_job_id()),
+                media_size=int(item["media"].get("file_size") or 0),
             )
         except BotError as exc:
             return f"Could not download: {self.config.redact(exc)}"
@@ -94,6 +97,7 @@ class BatchCache:
             safe_unlink(path, self.config.work_dir)
             return f"Not a readable video: {self.config.redact(exc)}"
         item["path"] = path
+        item["info"] = info
         item["duration"] = info["duration"]
         if info["duration"] > self.config.max_duration:
             safe_unlink(path, self.config.work_dir)

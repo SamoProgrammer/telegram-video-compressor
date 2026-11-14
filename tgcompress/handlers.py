@@ -15,6 +15,7 @@ from .media import (
     media_name,
     pick_media,
 )
+from .metrics import new_job_id
 from .settings import canonical_audio, canonical_target_size
 from .state import StateError, conversation_key
 from .telegram_api import reply_parameters
@@ -188,7 +189,7 @@ class Handlers:
             if state["mode"] == "single":
                 self.store.remove_pending(state, message_id)
             return
-        if state["processing"]:
+        if state["processing"] and state["mode"] == "batch":
             self.cards.api.call(
                 "sendMessage",
                 chat_id=chat_id,
@@ -212,9 +213,17 @@ class Handlers:
             "filename": filename_for(media_item, kind),
             "path": None,
             "duration": duration,
+            "job_id": message.get("_job_id") or new_job_id(),
             "status": "",
             "delivered": False,
         }
+
+        if state["processing"]:
+            state["queue"].append(item)
+            state["resume"] = True
+            state["note"] = "⏳ Video queued behind the current video."
+            self.cards.refresh(state)
+            return
 
         if state["mode"] == "batch":
             report = self.cards.report(state, item)
@@ -271,6 +280,7 @@ class Handlers:
                 deadline=deadline,
                 report=self.cards.report(state, item),
                 user_id=conversation_key(chat_id, user_id),
+                job_id=item["job_id"],
             )
             if "error" in result:
                 if state.get("cancel"):
@@ -300,7 +310,7 @@ class Handlers:
             state["note"] = ""
         else:
             state["note"] = f"{result['error']}"[:180]
-        state["resume"] = False
+        state["resume"] = bool(state["queue"])
         if "error" not in result:
             try:
                 self.store.record_receipt(state, message_id)

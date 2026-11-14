@@ -884,9 +884,11 @@ def compress(
     job_id: str | None = None,
     is_cancelled: Callable[[], bool] | None = None,
     on_process: Callable[[subprocess.Popen], None] | None = None,
+    probe_info: MediaInfo | dict | None = None,
+    metrics_job_id: str | None = None,
 ) -> MediaInfo:
     settings = settings or DEFAULT_SETTINGS
-    info = probe(src)
+    info = probe_info if probe_info is not None else probe(src)
     dur = duration if duration > 0 else info.get("duration", 0.0)
     if info["duration"] > max_duration:
         raise BotError(
@@ -930,8 +932,9 @@ def compress(
                 target_bitrate=target_bitrate,
             )
             err1_file = dst.parent / f"{dst.name}.pass1.err"
-            _run_ffmpeg_step(
-                cmd=pass1_cmd,
+            _profiled_ffmpeg_step(
+                pass1_cmd,
+                metrics_job_id,
                 err_file=err1_file,
                 duration=dur,
                 on_percent=on_percent,
@@ -955,8 +958,9 @@ def compress(
                 target_bitrate=target_bitrate,
             )
             err2_file = dst.parent / f"{dst.name}.pass2.err"
-            _run_ffmpeg_step(
-                cmd=pass2_cmd,
+            _profiled_ffmpeg_step(
+                pass2_cmd,
+                metrics_job_id,
                 err_file=err2_file,
                 duration=dur,
                 on_percent=on_percent,
@@ -985,8 +989,9 @@ def compress(
             pass_num=None,
         )
         err_file = dst.parent / f"{dst.name}.err"
-        _run_ffmpeg_step(
-            cmd=cmd,
+        _profiled_ffmpeg_step(
+            cmd,
+            metrics_job_id,
             err_file=err_file,
             duration=dur,
             on_percent=on_percent,
@@ -999,6 +1004,43 @@ def compress(
         )
 
     return probe(dst)
+
+
+def _profiled_ffmpeg_step(cmd: list[str], metrics_job_id: str | None, **kwargs) -> None:
+    import resource
+
+    from .metrics import stage
+
+    def option(name: str, default: str) -> str:
+        return cmd[cmd.index(name) + 1] if name in cmd else default
+
+    pass_number = int(option("-pass", "0")) or "crf"
+    with stage(
+        "ffmpeg",
+        job_id=metrics_job_id or kwargs.get("job_id"),
+        codec=option("-c:v", "unknown"),
+        preset=option("-preset", "default"),
+        cpu_used=option("-cpu-used", "default"),
+        threads=option("-threads", "auto"),
+        **{"pass": pass_number},
+    ) as stats:
+        before = resource.getrusage(resource.RUSAGE_CHILDREN)
+        try:
+            _run_ffmpeg_step(cmd=cmd, **kwargs)
+        finally:
+            after = resource.getrusage(resource.RUSAGE_CHILDREN)
+            stats["child_process_cpu_seconds"] = round(
+                after.ru_utime
+                + after.ru_stime
+                - before.ru_utime
+                - before.ru_stime,
+                3,
+            )
+            if cmd[-1] != "/dev/null":
+                try:
+                    stats["bytes"] = Path(cmd[-1]).stat().st_size
+                except OSError:
+                    pass
 
 
 def media_name(media: dict, kind: str) -> str:
